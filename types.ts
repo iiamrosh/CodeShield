@@ -3,6 +3,7 @@
 
 
 
+
 export enum Page {
   Splash,
   Auth,
@@ -24,6 +25,7 @@ export enum Page {
   TrainingMaterials,
   SafetyDrillsManagement,
   CreateSafetyDrill,
+  SafetyDrillDetail,
 }
 
 export enum FormType {

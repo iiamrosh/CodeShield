@@ -11,11 +11,12 @@ const supabase = self.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // Create the local database schema using Dexie
 const db = new Dexie("meil_safety_offline");
-db.version(1).stores({
+db.version(2).stores({
   // '++id' means auto-incrementing primary key
   // 'data' will store form fields
   // 'file' will store the Blob object for the photo/video
   upload_queue: '++id, data, file',
+  drafts: '++id, form_type, project_id',
 });
 
 // The main sync event handler

@@ -1,5 +1,6 @@
 
 
+
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Page, User, Project, FormType, FormField, UserRole, FormRecord, StatusUpdate, DraftRecord, TrainingMaterial, Notification, TrainingAssignment, SafetyDrill, WorkerDrill } from './types';
 import { ShieldIcon, SAFETY_MODULES, FORM_CONFIGS, DocumentIcon, VideoIcon, ImageIcon } from './constants';
@@ -231,7 +232,6 @@ const Modal: React.FC<{
 // --- MAIN APP ---
 const App: React.FC = () => {
     const [page, setPage] = useState<Page>(Page.Splash);
-    const [history, setHistory] = useState<Page[]>([]);
     const [currentUser, setCurrentUser] = useState<User | null>(null);
     const [projects, setProjects] = useState<Project[]>([]);
     const [selectedProject, setSelectedProject] = useState<Project | null>(null);
@@ -248,6 +248,7 @@ const App: React.FC = () => {
     const [modal, setModal] = useState({ isOpen: false, title: '', message: '', type: 'info' as 'info' | 'success' | 'error' | 'confirm', onClose: null as (() => void) | null, onConfirm: null as (() => void) | null });
     const [drafts, setDrafts] = useState<DraftRecord[]>([]);
     const [draftToEdit, setDraftToEdit] = useState<DraftRecord | null>(null);
+    const [selectedDrill, setSelectedDrill] = useState<SafetyDrill | null>(null);
     
     // New state for worker dashboard
     const [trainingAssignments, setTrainingAssignments] = useState<TrainingAssignment[]>([]);
@@ -271,6 +272,14 @@ const App: React.FC = () => {
         setModal({ ...modal, isOpen: false, onClose: null, onConfirm: null });
     };
 
+    const navigateAndReplace = useCallback((newPage: Page, data?: any) => {
+        if (data?.project) setSelectedProject(data.project);
+        setPage(newPage);
+        // Do not change the URL to prevent cross-origin errors in sandboxed environments.
+        // State is still managed, allowing back/forward navigation to work.
+        window.history.replaceState({ page: newPage, data }, '');
+    }, []);
+
     // --- AUTH & SESSION ---
     useEffect(() => {
         const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
@@ -279,7 +288,7 @@ const App: React.FC = () => {
                 fetchUserProfile(session.user.id);
             } else {
                 setCurrentUser(null);
-                setPage(Page.Auth);
+                navigateAndReplace(Page.Auth);
                 setIsLoading(false);
             }
         });
@@ -289,13 +298,13 @@ const App: React.FC = () => {
                  setSession(session);
                  fetchUserProfile(session.user.id);
             } else {
-                setPage(Page.Auth)
+                navigateAndReplace(Page.Auth);
                 setIsLoading(false);
             }
         });
 
         return () => subscription.unsubscribe();
-    }, []);
+    }, [navigateAndReplace]);
 
     const fetchUserProfile = async (userId: string) => {
         setIsLoading(true);
@@ -313,7 +322,7 @@ const App: React.FC = () => {
                 profilePhotoUrl: data.profile_photo_url,
             };
             setCurrentUser(user);
-            setPage(Page.ProjectHub);
+            navigateAndReplace(Page.ProjectHub);
         }
         setIsLoading(false);
     };
@@ -483,42 +492,69 @@ const App: React.FC = () => {
     }, [fetchForms, fetchProjects, fetchTrainingMaterials, fetchNotifications]);
 
     // --- NAVIGATION ---
+    useEffect(() => {
+        const handlePopState = (event: PopStateEvent) => {
+            if (event.state && event.state.page !== undefined) {
+                const { page: newPage, data } = event.state;
+                
+                // When restoring state, explicitly set or nullify values
+                // based on what's in the history data for that page. This prevents
+                // state from a previous page "leaking" into the current one, causing crashes.
+                setSelectedProject(data?.project || null);
+                setCurrentModule(data?.formType !== undefined ? data.formType : null);
+                setSelectedIssue(data?.issue || null);
+                setProjectToEdit(data?.projectToEdit || null);
+                setCurrentFormType(data?.currentFormType || null);
+                setDraftToEdit(data?.draftToEdit || null);
+                setSelectedDrill(data?.drill || null);
+                
+                setPage(newPage);
+            } else if (!event.state) {
+                 // This can happen on initial load or if history is cleared.
+                 setPage(currentUser ? Page.ProjectHub : Page.Auth);
+            }
+        };
+
+        window.addEventListener('popstate', handlePopState);
+        if (!window.history.state) {
+            // Do not change the URL to prevent cross-origin errors in sandboxed environments.
+            window.history.replaceState({ page }, '');
+        }
+
+        return () => window.removeEventListener('popstate', handlePopState);
+    }, [currentUser, page]);
+
     const goBack = useCallback(() => {
         if (page === Page.Form) {
             setDraftToEdit(null); // Clear any draft being edited when navigating back
         }
-        if (history.length > 0) {
-            const lastPage = history[history.length - 1];
-            setHistory(prev => prev.slice(0, -1));
-            setPage(lastPage);
-        } else {
-             setPage(currentUser ? Page.ProjectHub : Page.Auth);
-        }
-    }, [history, currentUser, page]);
+        window.history.back();
+    }, [page]);
 
-    const navigateTo = (newPage: Page, data?: any) => {
-        setHistory(prev => [...prev, page]);
-        
+    const navigateTo = useCallback((newPage: Page, data?: any) => {
         if (data?.project) setSelectedProject(data.project);
         if (data?.formType !== undefined) setCurrentModule(data.formType);
         if (data?.issue) setSelectedIssue(data.issue);
         if (data?.projectToEdit) setProjectToEdit(data.projectToEdit);
         if (data?.currentFormType) setCurrentFormType(data.currentFormType);
         if (data?.draftToEdit) setDraftToEdit(data.draftToEdit);
+        if (data?.drill) setSelectedDrill(data.drill);
 
+        let targetPage = newPage;
         if (newPage === Page.SafetyOfficerDashboard && data?.project) { 
             if (!currentUser) { setPage(Page.Auth); return; }
             switch (currentUser.role) {
-                case 'Site Safety Officer': setPage(Page.SafetyOfficerDashboard); break;
-                case 'HO middle Managers': setPage(Page.HOManagerDashboard); break;
-                case 'Top Managers': setPage(Page.TopManagerDashboard); break;
-                case 'Workers': setPage(Page.WorkerDashboard); break;
-                default: setPage(Page.SafetyOfficerDashboard);
+                case 'Site Safety Officer': targetPage = Page.SafetyOfficerDashboard; break;
+                case 'HO middle Managers': targetPage = Page.HOManagerDashboard; break;
+                case 'Top Managers': targetPage = Page.TopManagerDashboard; break;
+                case 'Workers': targetPage = Page.WorkerDashboard; break;
+                default: targetPage = Page.SafetyOfficerDashboard;
             }
-            return; 
         }
-        setPage(newPage);
-    };
+        setPage(targetPage);
+        // Do not change the URL to prevent cross-origin errors in sandboxed environments.
+        window.history.pushState({ page: targetPage, data }, '');
+    }, [currentUser]);
 
     const handleLogout = async () => {
         await supabase.auth.signOut();
@@ -526,8 +562,7 @@ const App: React.FC = () => {
         setSelectedProject(null);
         setProjects([]);
         setSubmittedForms([]);
-        setHistory([]);
-        setPage(Page.Auth);
+        navigateAndReplace(Page.Auth);
     };
     
     // --- CRUD OPERATIONS ---
@@ -585,8 +620,7 @@ const App: React.FC = () => {
                 'success',
                 () => {
                     fetchProjects();
-                    setHistory([]);
-                    setPage(Page.ProjectHub);
+                    navigateAndReplace(Page.ProjectHub);
                 }
             );
         }
@@ -607,8 +641,7 @@ const App: React.FC = () => {
         } else {
             showModal("Project Updated", "The project has been successfully updated.", 'success', () => {
                 fetchProjects();
-                setHistory([]);
-                setPage(Page.ProjectHub);
+                navigateAndReplace(Page.ProjectHub);
             });
         }
     };
@@ -653,24 +686,47 @@ const App: React.FC = () => {
         }
     };
     
+    // Core submission logic, can be called from multiple places. Throws on error.
+    const submitSingleRecordLogic = async (formType: FormType, projectId: string, user: User, recordData: Record<string, any>, fileData: Record<string, File | null>): Promise<void> => {
+        const submissionPayload = { data: { ...recordData } };
+        const fileEntries = Object.entries(fileData).filter(([, file]) => file instanceof File);
+    
+        for (const [fieldName, file] of fileEntries) {
+            if (file) {
+                const filePath = `uploads/${user.id}/${Date.now()}_${file.name}`;
+                const { error: uploadError } = await supabase.storage.from('safety-uploads').upload(filePath, file);
+                if (uploadError) throw new Error(`File upload failed: ${uploadError.message}`);
+                const { data: urlData } = supabase.storage.from('safety-uploads').getPublicUrl(filePath);
+                submissionPayload.data[fieldName] = urlData.publicUrl;
+            }
+        }
+    
+        const { error: insertError } = await supabase.from('form_records').insert({
+            form_type: formType,
+            project_id: projectId,
+            submitted_by_id: user.id,
+            data: submissionPayload.data,
+            status: 'Open'
+        });
+    
+        if (insertError) throw new Error(`Database insert failed: ${insertError.message}`);
+    };
+
     const handleAddFormRecord = async (recordData: Record<string, any>, fileData: Record<string, File | null>, draftIdToDelete?: number) => {
         if (!currentFormType || !selectedProject || !currentUser) return;
         
         setIsLoading(true);
-
-        const submissionPayload = {
-            formType: currentFormType,
-            projectId: selectedProject.id,
-            submittedById: currentUser.id,
-            data: recordData,
-        };
-        
-        const fileEntries = Object.entries(fileData).filter(([, file]) => file instanceof File);
         
         if (!isOnline) {
             try {
+                 const submissionPayload = {
+                    formType: currentFormType,
+                    projectId: selectedProject.id,
+                    submittedById: currentUser.id,
+                    data: recordData,
+                };
                 // For offline, we can only support one file for simplicity in the queue.
-                const firstFile = fileEntries.length > 0 ? fileEntries[0][1] : null;
+                const firstFile = Object.values(fileData).find(f => f instanceof File) || null;
                 await localDb.upload_queue.add({ data: submissionPayload, file: firstFile });
                 if (navigator.serviceWorker.ready) {
                     const registration = await navigator.serviceWorker.ready;
@@ -685,27 +741,8 @@ const App: React.FC = () => {
             }
         } else {
             try {
-                // Handle multiple file uploads
-                for (const [fieldName, file] of fileEntries) {
-                    if (file) {
-                        const filePath = `uploads/${currentUser.id}/${Date.now()}_${file.name}`;
-                        const { error: uploadError } = await supabase.storage.from('safety-uploads').upload(filePath, file);
-                        if (uploadError) throw new Error('File upload failed: ' + uploadError.message);
-                        const { data: urlData } = supabase.storage.from('safety-uploads').getPublicUrl(filePath);
-                        submissionPayload.data[fieldName] = urlData.publicUrl; // Store URL back in the data object
-                    }
-                }
+                await submitSingleRecordLogic(currentFormType, selectedProject.id, currentUser, recordData, fileData);
 
-                const { error: insertError } = await supabase.from('form_records').insert({
-                    form_type: submissionPayload.formType,
-                    project_id: submissionPayload.projectId,
-                    submitted_by_id: submissionPayload.submittedById,
-                    data: submissionPayload.data,
-                    status: 'Open'
-                });
-
-                if (insertError) throw new Error('Database insert failed: ' + insertError.message);
-                
                 if (draftIdToDelete) {
                     await localDb.drafts.delete(draftIdToDelete);
                     await fetchDrafts();
@@ -720,17 +757,63 @@ const App: React.FC = () => {
             }
         }
         
-        const historyCopy = [...history];
-        historyCopy.pop();
-        historyCopy.pop();
-        setHistory(historyCopy);
         setDraftToEdit(null); // Clear edited draft
         
+        let dashboardPage: Page;
         switch(currentUser.role) {
-            case 'Site Safety Officer': setPage(Page.SafetyOfficerDashboard); break;
-            case 'Workers': setPage(Page.WorkerDashboard); break;
-            default: setPage(Page.SafetyOfficerDashboard); break;
+            case 'Site Safety Officer': dashboardPage = Page.SafetyOfficerDashboard; break;
+            case 'Workers': dashboardPage = Page.WorkerDashboard; break;
+            default: dashboardPage = Page.SafetyOfficerDashboard; break;
         }
+        navigateAndReplace(dashboardPage, { project: selectedProject });
+    };
+
+    const handleBulkDeleteDrafts = async (draftIds: number[]) => {
+        showModal(
+            "Confirm Deletion",
+            `Are you sure you want to delete ${draftIds.length} selected drafts? This action cannot be undone.`,
+            'confirm',
+            closeModal,
+            async () => {
+                closeModal();
+                setIsLoading(true);
+                await localDb.drafts.bulkDelete(draftIds);
+                await fetchDrafts();
+                setIsLoading(false);
+                showModal("Success", `${draftIds.length} drafts deleted successfully.`, 'success');
+            }
+        );
+    };
+
+    const handleBulkSubmitDrafts = async (draftIds: number[]) => {
+        if (!currentUser) return;
+        if (!isOnline) {
+            showModal("Offline Mode", "Bulk submission is not available while offline.", 'info');
+            return;
+        }
+    
+        setIsLoading(true);
+        const draftsToSubmit = await localDb.drafts.where('id').anyOf(draftIds).toArray();
+        let successCount = 0;
+        let errorCount = 0;
+        
+        for (const draft of draftsToSubmit) {
+            try {
+                await submitSingleRecordLogic(draft.form_type, draft.project_id, currentUser, draft.data, draft.fileData);
+                await localDb.drafts.delete(draft.id!);
+                successCount++;
+            } catch (error) {
+                console.error(`Failed to submit draft ${draft.id}:`, error);
+                errorCount++;
+            }
+        }
+    
+        await fetchDrafts();
+        await fetchForms();
+        setIsLoading(false);
+    
+        const message = `${successCount} drafts submitted successfully.` + (errorCount > 0 ? ` ${errorCount} failed.` : '');
+        showModal("Bulk Submission Complete", message, 'info');
     };
 
     const handleDeleteFormRecord = async (issueId: string, issueIdentifier: string) => {
@@ -771,7 +854,8 @@ const App: React.FC = () => {
         setIsLoading(true);
 
         try {
-            const filePath = `training_materials/${selectedProject.id}/${Date.now()}_${file.name}`;
+            const sanitizedFileName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+            const filePath = `training_materials/${selectedProject.id}/${Date.now()}_${sanitizedFileName}`;
             const { error: uploadError } = await supabase.storage.from('safety-uploads').upload(filePath, file);
             if (uploadError) throw new Error(`File upload failed: ${uploadError.message}`);
             
@@ -1039,7 +1123,7 @@ const App: React.FC = () => {
         Page.SafetyOfficerDashboard, Page.HOManagerDashboard, Page.TopManagerDashboard,
         Page.WorkerDashboard, Page.Form, Page.TrainingMaterials, Page.ModuleLanding,
         Page.IssueList, Page.ReportsDashboard, Page.DraftList,
-        Page.SafetyDrillsManagement, Page.CreateSafetyDrill
+        Page.SafetyDrillsManagement, Page.CreateSafetyDrill, Page.SafetyDrillDetail
     ], []);
 
     const needsProject = pagesRequiringProject.includes(page);
@@ -1049,10 +1133,9 @@ const App: React.FC = () => {
         // This commonly occurs on a browser refresh when in-memory state is lost.
         if (needsProject && !selectedProject && currentUser) {
             console.warn("Redirecting to Project Hub: no project selected for a protected page.");
-            setHistory([]); 
-            setPage(Page.ProjectHub);
+            navigateAndReplace(Page.ProjectHub);
         }
-    }, [page, selectedProject, needsProject, currentUser]);
+    }, [page, selectedProject, needsProject, currentUser, navigateAndReplace]);
 
     const renderPage = () => {
         const showBackButton = ![Page.Splash, Page.Auth, Page.ProjectHub].includes(page) && 
@@ -1097,9 +1180,12 @@ const App: React.FC = () => {
                 case Page.IssueDetail: return <IssueDetailScreen issue={selectedIssue!} onStatusUpdate={handleStatusUpdate} currentUser={currentUser!} showModal={showModal} />;
                 case Page.ModuleSelection: return <ModuleSelectionScreen onNavigate={navigateTo} />;
                 case Page.ReportsDashboard: return <ReportsDashboardScreen project={selectedProject!} allIssues={submittedForms} onExport={exportToCsv} onNavigate={navigateTo} />;
-                case Page.DraftList: return <DraftListScreen moduleType={currentModule!} project={selectedProject!} drafts={drafts} onNavigate={navigateTo} onDeleteDraft={(id) => showModal("Confirm Deletion", "Are you sure you want to delete this draft?", 'confirm', closeModal, () => { closeModal(); handleDeleteDraft(id); })} />;
+                case Page.DraftList: return <DraftListScreen moduleType={currentModule!} project={selectedProject!} drafts={drafts} onNavigate={navigateTo} onDeleteDraft={(id) => showModal("Confirm Deletion", "Are you sure you want to delete this draft?", 'confirm', closeModal, () => { closeModal(); handleDeleteDraft(id); })} onBulkDeleteDrafts={handleBulkDeleteDrafts} onBulkSubmitDrafts={handleBulkSubmitDrafts} />;
                 case Page.SafetyDrillsManagement: return <SafetyDrillsManagementScreen project={selectedProject!} drills={safetyDrills} onNavigate={navigateTo} onDelete={handleDeleteDrill} />;
                 case Page.CreateSafetyDrill: return <CreateSafetyDrillScreen project={selectedProject!} onAddDrill={handleAddDrill} />;
+                case Page.SafetyDrillDetail:
+                    const workerDrillForDetail = workerDrills.find(wd => wd.drill_id === selectedDrill!.id);
+                    return <SafetyDrillDetailScreen drill={selectedDrill!} workerDrill={workerDrillForDetail} onUpdateDrillProgress={handleUpdateDrillProgress} />;
                 default: return <AuthScreen onNavigate={navigateTo} showModal={showModal}/>;
             }
         };
@@ -1128,7 +1214,10 @@ const App: React.FC = () => {
 
     return (
         <div className="bg-[#FAF9F6] min-h-screen font-sans">
-            <div className="max-w-md mx-auto bg-white shadow-2xl min-h-screen">
+            <div 
+                className="max-w-md mx-auto bg-white shadow-2xl min-h-screen"
+                style={{ paddingTop: 'env(safe-area-inset-top)' }}
+            >
                 {renderPage()}
             </div>
         </div>
@@ -1438,12 +1527,12 @@ const SafetyOfficerDashboard: React.FC<{ user: User; project: Project; onNavigat
                  <button onClick={() => onNavigate(Page.ProjectHub)} className="bg-white border border-gray-300 text-gray-700 px-4 py-2 rounded-lg font-semibold text-sm flex items-center justify-center space-x-2 shadow-sm hover:bg-gray-50 mb-2 w-full"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 19l-7-7 7-7" /></svg><span>Back to Project Hub</span></button>
                 <p className="text-center font-semibold text-gray-700">Project: {project.name}</p>
                 
-                 <button onClick={() => onNavigate(Page.TrainingMaterials)} className="w-full bg-[#42A5F5] text-white p-4 rounded-xl shadow-lg text-left">
+                 <button onClick={() => onNavigate(Page.TrainingMaterials, { project })} className="w-full bg-[#42A5F5] text-white p-4 rounded-xl shadow-lg text-left">
                     <h3 className="font-bold text-lg">Manage Training Materials</h3>
                     <p className="text-xs mt-1 text-blue-100">Upload and manage training content for workers.</p>
                 </button>
 
-                <button onClick={() => onNavigate(Page.SafetyDrillsManagement)} className="w-full bg-[#F9A825] text-white p-4 rounded-xl shadow-lg text-left">
+                <button onClick={() => onNavigate(Page.SafetyDrillsManagement, { project })} className="w-full bg-[#F9A825] text-white p-4 rounded-xl shadow-lg text-left">
                     <h3 className="font-bold text-lg">Manage Safety Drills</h3>
                     <p className="text-xs mt-1 text-yellow-100">Create and assign safety drills to workers.</p>
                 </button>
@@ -1452,7 +1541,7 @@ const SafetyOfficerDashboard: React.FC<{ user: User; project: Project; onNavigat
                     const stats = moduleStats[module.title] || { safe: 0, medium: 0, critical: 0 };
                     const isReportsModule = module.title === FormType.Reports;
                     return (
-                        <button key={module.title} onClick={() => onNavigate(isReportsModule ? Page.ReportsDashboard : Page.ModuleLanding, { formType: module.title })} className="w-full bg-[#2E2E2E] text-white p-4 rounded-xl shadow-lg text-left disabled:opacity-50 disabled:cursor-not-allowed">
+                        <button key={module.title} onClick={() => onNavigate(isReportsModule ? Page.ReportsDashboard : Page.ModuleLanding, { project, formType: module.title })} className="w-full bg-[#2E2E2E] text-white p-4 rounded-xl shadow-lg text-left disabled:opacity-50 disabled:cursor-not-allowed">
                             <h3 className="font-bold text-lg">{module.title}</h3>
                              {isReportsModule ? (
                                 <p className="text-xs mt-1 text-gray-400">Generate summaries and analyze performance</p>
@@ -1503,7 +1592,7 @@ const HOManagerDashboard: React.FC<{ user: User, project: Project, onNavigate: (
             <div className="p-4 space-y-4">
                 <button onClick={() => onNavigate(Page.ProjectHub)} className="bg-white border border-gray-300 text-gray-700 px-4 py-2 rounded-lg font-semibold text-sm flex items-center justify-center space-x-2 shadow-sm hover:bg-gray-50 mb-2 w-full"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 19l-7-7 7-7" /></svg><span>Back to Project Hub</span></button>
                 <p className="text-center font-semibold text-gray-700">Project: {project.name}</p>
-                <DashboardCard title="Training Content"><p className="text-sm text-gray-600 mb-4">Upload and manage training content for this project.</p><button onClick={() => onNavigate(Page.TrainingMaterials)} className="w-full bg-[#42A5F5] text-white py-3 rounded-lg font-semibold hover:bg-blue-600 transition shadow-md">Manage Materials</button></DashboardCard>
+                <DashboardCard title="Training Content"><p className="text-sm text-gray-600 mb-4">Upload and manage training content for this project.</p><button onClick={() => onNavigate(Page.TrainingMaterials, { project })} className="w-full bg-[#42A5F5] text-white py-3 rounded-lg font-semibold hover:bg-blue-600 transition shadow-md">Manage Materials</button></DashboardCard>
                 <DashboardCard title="Drill Performance">
                      <div className="grid grid-cols-3 gap-2 text-center">
                         <div><p className="text-2xl font-bold text-blue-600">{drillPerformance.totalDrills}</p><p className="text-xs text-gray-500">Total Drills</p></div>
@@ -1512,7 +1601,7 @@ const HOManagerDashboard: React.FC<{ user: User, project: Project, onNavigate: (
                     </div>
                 </DashboardCard>
                 <DashboardCard title="Field Performance Analysis"><p className="text-sm text-gray-600 mb-4">Top reported issue types for this project.</p><ReportsBarChart data={reportsByModule} /></DashboardCard>
-                <DashboardCard title="Generate Custom Report"><p className="text-sm text-gray-600 mb-4">Filter all reports by date and type for deep analysis.</p><button onClick={() => onNavigate(Page.ReportsDashboard)} className="w-full bg-[#1FA97C] text-white py-3 rounded-lg font-semibold hover:bg-green-700 transition shadow-md">Open Report Generator</button></DashboardCard>
+                <DashboardCard title="Generate Custom Report"><p className="text-sm text-gray-600 mb-4">Filter all reports by date and type for deep analysis.</p><button onClick={() => onNavigate(Page.ReportsDashboard, { project })} className="w-full bg-[#1FA97C] text-white py-3 rounded-lg font-semibold hover:bg-green-700 transition shadow-md">Open Report Generator</button></DashboardCard>
             </div>
         </div>
     );
@@ -1602,7 +1691,7 @@ const TopManagerDashboard: React.FC<{ user: User, project: Project, onNavigate: 
                     <p className="text-sm text-gray-600 mb-2">Monthly trend of submitted vs. closed reports.</p>
                     <TrendLineChart datasets={trendData} />
                 </DashboardCard>
-                 <DashboardCard title="Training Content"><p className="text-sm text-gray-600 mb-4">Oversee training content performance for this project.</p><button onClick={() => onNavigate(Page.TrainingMaterials)} className="w-full bg-[#42A5F5] text-white py-3 rounded-lg font-semibold hover:bg-blue-600 transition shadow-md">View Materials</button></DashboardCard>
+                 <DashboardCard title="Training Content"><p className="text-sm text-gray-600 mb-4">Oversee training content performance for this project.</p><button onClick={() => onNavigate(Page.TrainingMaterials, { project })} className="w-full bg-[#42A5F5] text-white py-3 rounded-lg font-semibold hover:bg-blue-600 transition shadow-md">View Materials</button></DashboardCard>
                  <DashboardCard title="Drill Performance">
                      <div className="grid grid-cols-3 gap-2 text-center">
                         <div><p className="text-2xl font-bold text-blue-600">{drillPerformance.totalDrills}</p><p className="text-xs text-gray-500">Total Drills</p></div>
@@ -1613,7 +1702,7 @@ const TopManagerDashboard: React.FC<{ user: User, project: Project, onNavigate: 
                 <DashboardCard title="Project Data Actions">
                     <div className="space-y-3">
                         <p className="text-sm text-gray-600">Filter all reports for strategic insights or export the full dataset for this project.</p>
-                        <button onClick={() => onNavigate(Page.ReportsDashboard)} className="w-full bg-[#1FA97C] text-white py-3 rounded-lg font-semibold hover:bg-green-700 transition shadow-md">Open Report Generator</button>
+                        <button onClick={() => onNavigate(Page.ReportsDashboard, { project })} className="w-full bg-[#1FA97C] text-white py-3 rounded-lg font-semibold hover:bg-green-700 transition shadow-md">Open Report Generator</button>
                         <button onClick={() => onExport(projectForms, `${project.name.replace(/\s/g, '_')}_FullExport`)} className="w-full bg-blue-500 text-white py-3 rounded-lg font-semibold hover:bg-blue-600 transition shadow-md">Export All Project Data</button>
                     </div>
                 </DashboardCard>
@@ -1709,32 +1798,43 @@ const WorkerDashboard: React.FC<{
                                 const myDrillRecord = workerDrills.find(wd => wd.drill_id === drill.id);
                                 const completedSteps = myDrillRecord?.completed_steps || [];
                                 const totalSteps = drill.steps.length;
-                                const isCompleted = completedSteps.length === totalSteps && totalSteps > 0;
+                                const isCompleted = totalSteps > 0 && completedSteps.length === totalSteps;
+                                const progress = totalSteps > 0 ? (completedSteps.length / totalSteps) * 100 : 0;
+                                
                                 return (
-                                    <div key={drill.id} className="p-3 bg-gray-50 rounded-lg">
-                                        <div className="flex justify-between items-start">
-                                            <div>
-                                                <p className="font-semibold text-sm text-gray-800">{drill.title}</p>
-                                                <p className="text-xs text-gray-500">{drill.description}</p>
+                                    <button 
+                                        key={drill.id} 
+                                        className={`w-full text-left p-3 rounded-lg transition-all hover:shadow-lg active:scale-[0.98] ${isCompleted ? 'bg-green-50 border border-green-200' : 'bg-gray-50'}`}
+                                        onClick={() => onNavigate(Page.SafetyDrillDetail, { drill })}
+                                        aria-label={`View details for drill: ${drill.title}`}
+                                    >
+                                        <div className="flex justify-between items-start mb-2">
+                                            <div className="pr-2">
+                                                <p className={`font-semibold text-sm ${isCompleted ? 'text-green-800' : 'text-gray-800'}`}>{drill.title}</p>
+                                                <p className="text-xs text-gray-500 truncate">{drill.description}</p>
                                             </div>
-                                            <span className={`text-xs font-semibold px-2 py-1 rounded-full mt-1 flex-shrink-0 ${isCompleted ? 'bg-green-100 text-green-700' : 'bg-yellow-100 text-yellow-700'}`}>
-                                                {completedSteps.length}/{totalSteps}
-                                            </span>
+                                            <div className="flex-shrink-0">
+                                                {isCompleted ? (
+                                                    <span className="text-xs font-semibold px-2 py-1 rounded-full flex items-center space-x-1 bg-green-100 text-green-700">
+                                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" /></svg>
+                                                        <span>Completed</span>
+                                                    </span>
+                                                ) : (
+                                                    <span className="text-xs font-semibold px-2 py-1 rounded-full bg-yellow-100 text-yellow-700">
+                                                        {completedSteps.length}/{totalSteps} steps
+                                                    </span>
+                                                )}
+                                            </div>
                                         </div>
-                                        <div className="mt-3 space-y-2">
-                                            {drill.steps.map((step, index) => (
-                                                <label key={index} className="flex items-center space-x-2 cursor-pointer">
-                                                    <input 
-                                                        type="checkbox" 
-                                                        checked={completedSteps.includes(index)} 
-                                                        onChange={() => onUpdateDrillProgress(drill, index)}
-                                                        className="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
-                                                    />
-                                                    <span className={`text-sm ${completedSteps.includes(index) ? 'text-gray-400 line-through' : 'text-gray-700'}`}>{step}</span>
-                                                </label>
-                                            ))}
-                                        </div>
-                                    </div>
+                                        
+                                        {!isCompleted && totalSteps > 0 && (
+                                            <div className="my-2">
+                                                <div className="w-full bg-gray-200 rounded-full h-1.5">
+                                                    <div className="bg-blue-500 h-1.5 rounded-full" style={{ width: `${progress}%` }}></div>
+                                                </div>
+                                            </div>
+                                        )}
+                                    </button>
                                 )
                             })}
                         </div>
@@ -1784,7 +1884,7 @@ const WorkerDashboard: React.FC<{
                     </div>
                 </DashboardCard>
 
-                <button onClick={() => onNavigate(Page.Form, { currentFormType: FormType.GoodPractices })} className="w-full bg-[#2E2E2E] text-white p-4 rounded-xl shadow-lg text-left"><h3 className="font-bold text-lg">Report Good Practice</h3><p className="text-xs mt-1 text-gray-300">Spotted something safe? Let us know!</p></button>
+                <button onClick={() => onNavigate(Page.Form, { project, currentFormType: FormType.GoodPractices })} className="w-full bg-[#2E2E2E] text-white p-4 rounded-xl shadow-lg text-left"><h3 className="font-bold text-lg">Report Good Practice</h3><p className="text-xs mt-1 text-gray-300">Spotted something safe? Let us know!</p></button>
             </div>
         </div>
     );
@@ -2004,28 +2104,99 @@ const DraftListScreen: React.FC<{
     drafts: DraftRecord[]; 
     onNavigate: (page: Page, data?: any) => void;
     onDeleteDraft: (draftId: number) => void;
-}> = ({ moduleType, project, drafts, onNavigate, onDeleteDraft }) => {
+    onBulkDeleteDrafts: (draftIds: number[]) => void;
+    onBulkSubmitDrafts: (draftIds: number[]) => void;
+}> = ({ moduleType, project, drafts, onNavigate, onDeleteDraft, onBulkDeleteDrafts, onBulkSubmitDrafts }) => {
+    const [selectedDraftIds, setSelectedDraftIds] = useState<number[]>([]);
+
     const relevantDrafts = useMemo(() => drafts.filter(draft => 
         draft.project_id === project.id && draft.form_type === moduleType
     ).sort((a,b) => new Date(b.saved_at).getTime() - new Date(a.saved_at).getTime()), [drafts, project.id, moduleType]);
 
+    useEffect(() => {
+        // Clear selection if the list of relevant drafts changes (e.g., after deletion)
+        setSelectedDraftIds([]);
+    }, [relevantDrafts.length]);
+
+    const handleSelectAll = (e: React.ChangeEvent<HTMLInputElement>) => {
+        if (e.target.checked) {
+            setSelectedDraftIds(relevantDrafts.map(d => d.id!));
+        } else {
+            setSelectedDraftIds([]);
+        }
+    };
+
+    const handleSelectOne = (draftId: number) => {
+        setSelectedDraftIds(prev => 
+            prev.includes(draftId)
+                ? prev.filter(id => id !== draftId)
+                : [...prev, draftId]
+        );
+    };
+    
+    const handleBulkDelete = () => {
+        onBulkDeleteDrafts(selectedDraftIds);
+        setSelectedDraftIds([]);
+    };
+
+    const handleBulkSubmit = () => {
+        onBulkSubmitDrafts(selectedDraftIds);
+        setSelectedDraftIds([]);
+    };
+
+    const areAllSelected = relevantDrafts.length > 0 && selectedDraftIds.length === relevantDrafts.length;
+
     return (
-        <div className="bg-[#FAF9F6] min-h-screen">
+        <div className="bg-[#FAF9F6] min-h-screen flex flex-col">
             <PageHeader title={`${moduleType} Drafts`}><p className="text-sm font-semibold text-gray-500 mt-1">Project: {project.name}</p></PageHeader>
-            <div className="p-4 space-y-3">
-                {relevantDrafts.length > 0 ? (relevantDrafts.map(draft => (
-                    <div key={draft.id} className="w-full bg-white p-4 rounded-xl shadow-md text-left flex justify-between items-center">
-                        <div>
-                            <p className="font-bold text-gray-800">{draft.data.observationId || draft.data.trainingId || 'Draft'}</p>
-                            <p className="text-sm text-gray-500">Saved: {new Date(draft.saved_at).toLocaleString()}</p>
-                        </div>
-                        <div className="flex space-x-2">
-                            <button onClick={() => onNavigate(Page.Form, { draftToEdit: draft, currentFormType: moduleType })} className="bg-blue-500 text-white px-3 py-1 rounded-lg text-sm font-semibold">Edit</button>
-                            <button onClick={() => onDeleteDraft(draft.id!)} className="bg-red-500 text-white px-3 py-1 rounded-lg text-sm font-semibold">Delete</button>
-                        </div>
+            <div className={`flex-grow p-4 space-y-3 ${selectedDraftIds.length > 0 ? 'pb-28' : ''}`}>
+                {relevantDrafts.length > 0 && (
+                     <div className="flex items-center space-x-3 p-2 bg-gray-100 rounded-lg border">
+                        <input 
+                            type="checkbox"
+                            id="select-all"
+                            checked={areAllSelected}
+                            onChange={handleSelectAll}
+                            className="h-5 w-5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                            aria-label="Select all drafts"
+                        />
+                        <label htmlFor="select-all" className="text-sm font-medium text-gray-700">Select All</label>
                     </div>
-                ))) : (<div className="text-center py-10"><p className="text-gray-500">No drafts found for this module.</p></div>)}
+                )}
+                {relevantDrafts.length > 0 ? (relevantDrafts.map(draft => {
+                    const isSelected = selectedDraftIds.includes(draft.id!);
+                    return (
+                        <div key={draft.id} className={`w-full bg-white p-4 rounded-xl shadow-md text-left flex items-center transition-colors ${isSelected ? 'bg-blue-50 ring-2 ring-blue-500' : ''}`}>
+                            <input
+                                 type="checkbox"
+                                 checked={isSelected}
+                                 onChange={() => handleSelectOne(draft.id!)}
+                                 className="h-5 w-5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 mr-4 flex-shrink-0"
+                                 aria-label={`Select draft ${draft.data.observationId || draft.id}`}
+                            />
+                            <div className="flex-grow flex justify-between items-center">
+                                <div>
+                                    <p className="font-bold text-gray-800">{draft.data.observationId || draft.data.trainingId || 'Draft'}</p>
+                                    <p className="text-sm text-gray-500">Saved: {new Date(draft.saved_at).toLocaleString()}</p>
+                                </div>
+                                <div className="flex space-x-2">
+                                    <button onClick={() => onNavigate(Page.Form, { draftToEdit: draft, currentFormType: moduleType })} className="bg-blue-500 text-white px-3 py-1 rounded-lg text-sm font-semibold">Edit</button>
+                                    <button onClick={() => onDeleteDraft(draft.id!)} className="bg-red-500 text-white px-3 py-1 rounded-lg text-sm font-semibold">Delete</button>
+                                </div>
+                            </div>
+                        </div>
+                    );
+                })) : (<div className="text-center py-10"><p className="text-gray-500">No drafts found for this module.</p></div>)}
             </div>
+             {selectedDraftIds.length > 0 && (
+                <div className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-md bg-white p-4 border-t-2 border-[#1FA97C] shadow-[0_-4px_10px_rgba(0,0,0,0.1)] z-20">
+                    <p className="text-center text-sm font-semibold text-gray-700 mb-3">{selectedDraftIds.length} draft(s) selected</p>
+                    <div className="flex space-x-3">
+                        <button onClick={handleBulkDelete} className="w-full bg-red-600 text-white py-2 rounded-lg font-semibold hover:bg-red-700 transition">Delete Selected</button>
+                        <button onClick={handleBulkSubmit} className="w-full bg-green-600 text-white py-2 rounded-lg font-semibold hover:bg-green-700 transition">Submit Selected</button>
+                    </div>
+                </div>
+            )}
         </div>
     );
 };
@@ -2337,14 +2508,16 @@ const TrainingMaterialsScreen: React.FC<{
 
     const projectMaterials = useMemo(() => materials.filter(m => m.project_id === project.id), [materials, project.id]);
     
-    const handleSubmit = (e: React.FormEvent) => {
+    const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
         e.preventDefault();
         if (title && file) {
             onAdd(title, description, file);
+            // Reset state after submission.
+            // The native e.currentTarget.reset() was removed as it can cause
+            // conflicts with React's controlled component state management.
             setTitle('');
             setDescription('');
             setFile(null);
-            (e.target as HTMLFormElement).reset(); // Clear file input
         }
     };
 
@@ -2505,6 +2678,72 @@ const SafetyDrillsManagementScreen: React.FC<{
                         <p className="text-sm text-gray-500 text-center py-4">No safety drills created for this project yet.</p>
                     )}
                 </DashboardCard>
+            </div>
+        </div>
+    );
+};
+
+const SafetyDrillDetailScreen: React.FC<{
+    drill: SafetyDrill;
+    workerDrill: WorkerDrill | undefined;
+    onUpdateDrillProgress: (drill: SafetyDrill, stepIndex: number) => void;
+}> = ({ drill, workerDrill, onUpdateDrillProgress }) => {
+    const completedSteps = workerDrill?.completed_steps || [];
+    const totalSteps = drill.steps.length;
+    const isCompleted = totalSteps > 0 && completedSteps.length === totalSteps;
+    const progress = totalSteps > 0 ? (completedSteps.length / totalSteps) * 100 : 0;
+
+    return (
+        <div className="bg-[#FAF9F6] min-h-screen">
+            <PageHeader title="Safety Drill Details" />
+            <div className="p-6">
+                <div className={`bg-white p-6 rounded-2xl shadow-lg space-y-4 border-t-4 ${isCompleted ? 'border-green-500' : 'border-blue-500'}`}>
+                    <div className="flex justify-between items-start mb-2">
+                        <div>
+                            <h2 className="text-xl font-bold text-gray-800">{drill.title}</h2>
+                            {drill.due_date && <p className="text-sm text-red-500 mt-1">Due: {new Date(drill.due_date).toLocaleDateString()}</p>}
+                        </div>
+                         <div className="flex-shrink-0">
+                            {isCompleted ? (
+                                <span className="text-sm font-semibold px-3 py-1 rounded-full flex items-center space-x-1 bg-green-100 text-green-700">
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" /></svg>
+                                    <span>Completed</span>
+                                </span>
+                            ) : (
+                                <span className="text-sm font-semibold px-3 py-1 rounded-full bg-yellow-100 text-yellow-700">
+                                    {completedSteps.length}/{totalSteps} steps
+                                </span>
+                            )}
+                        </div>
+                    </div>
+                    
+                    {!isCompleted && totalSteps > 0 && (
+                        <div className="my-2">
+                            <div className="w-full bg-gray-200 rounded-full h-2.5">
+                                <div className="bg-blue-500 h-2.5 rounded-full" style={{ width: `${progress}%` }}></div>
+                            </div>
+                        </div>
+                    )}
+                    
+                    <p className="text-gray-600 text-sm">{drill.description}</p>
+                    
+                    <div className="pt-4 border-t border-gray-100">
+                         <h3 className="text-md font-semibold text-gray-700 mb-3">Steps to Complete:</h3>
+                         <div className="space-y-3">
+                            {drill.steps.map((step, index) => (
+                                <label key={index} className="flex items-center space-x-3 p-3 bg-gray-50 rounded-lg cursor-pointer hover:bg-gray-100 transition">
+                                    <input 
+                                        type="checkbox" 
+                                        checked={completedSteps.includes(index)} 
+                                        onChange={() => onUpdateDrillProgress(drill, index)}
+                                        className="h-5 w-5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                                    />
+                                    <span className={`text-md ${completedSteps.includes(index) ? 'text-gray-400 line-through' : 'text-gray-800'}`}>{step}</span>
+                                </label>
+                            ))}
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     );
