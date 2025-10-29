@@ -4,8 +4,8 @@ importScripts("https://unpkg.com/dexie@3/dist/dexie.js");
 importScripts("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2");
 
 // IMPORTANT: You must manually paste your Supabase URL and Key here as well, as environment variables are not available in the worker.
-const SUPABASE_URL = 'YOUR_SUPABASE_URL';
-const SUPABASE_KEY = 'YOUR_SUPABASE_ANON_KEY';
+const SUPABASE_URL = 'https://ykoqzdempfwypbhovypt.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inlrb3F6ZGVtcGZ3eXBiaG92eXB0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE2NTQxODQsImV4cCI6MjA3NzIzMDE4NH0.NLojAiSstJNjugSbrjJBeqUWoWhvM-RpXmJ2_ORwyZc';
 
 const supabase = self.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -39,27 +39,25 @@ async function syncReports() {
   for (const report of pendingReports) {
     try {
       let photoUrl = null;
+      const submissionData = report.data.data; // The actual form fields are nested
+      
       // Step 1: If there's a file, upload it to Supabase Storage first.
       if (report.file) {
         const filePath = `uploads/${report.data.submittedById}/${Date.now()}_${report.file.name}`;
         
         const { error: uploadError } = await supabase.storage
-          .from('safety-uploads') // Make sure you create a bucket named 'safety-uploads' in Supabase
+          .from('safety-uploads')
           .upload(filePath, report.file);
 
         if (uploadError) {
           throw new Error('File upload failed: ' + uploadError.message);
         }
-
-        // Get the public URL of the uploaded file
+        
         const { data: urlData } = supabase.storage.from('safety-uploads').getPublicUrl(filePath);
         photoUrl = urlData.publicUrl;
       }
       
-      // Step 2: Add the photo URL to the report data
-      // We assume your photo fields are named like 'beforePhoto', 'afterPhoto', etc.
-      // This logic might need to be adjusted based on your form structure.
-      const submissionData = { ...report.data };
+      // Step 2: Add the photo URL back to the data blob if it exists.
       if (photoUrl) {
           const photoField = Object.keys(submissionData).find(k => k.toLowerCase().includes('photo'));
           if (photoField) {
@@ -68,14 +66,14 @@ async function syncReports() {
       }
 
       // Step 3: Insert the main form record into the 'form_records' table in Supabase.
-      // NOTE: You need to create a `form_records` table in Supabase.
       const { error: insertError } = await supabase
         .from('form_records')
         .insert([{
-            form_type: submissionData.formType,
-            project_id: submissionData.projectId,
-            submitted_by_id: submissionData.submittedById,
-            data: submissionData, // Store the entire form data blob
+            form_type: report.data.formType,
+            project_id: report.data.projectId,
+            submitted_by_id: report.data.submittedById,
+            data: submissionData, // Store the form-specific fields
+            status: 'Open',
         }]);
 
       if (insertError) {
