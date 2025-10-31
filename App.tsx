@@ -1,6 +1,3 @@
-
-
-
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Page, User, Project, FormType, FormField, UserRole, FormRecord, StatusUpdate, DraftRecord, TrainingMaterial, Notification, TrainingAssignment, SafetyDrill, WorkerDrill } from './types';
 import { ShieldIcon, SAFETY_MODULES, FORM_CONFIGS, DocumentIcon, VideoIcon, ImageIcon } from './constants';
@@ -1571,8 +1568,8 @@ const HOManagerDashboard: React.FC<{ user: User, project: Project, onNavigate: (
             acc[form.form_type] = (acc[form.form_type] || 0) + 1;
             return acc;
         }, {} as Record<FormType, number>);
-        
-        return Object.entries(counts).map(([label, value]) => ({ label, value })).sort((a,b) => b.value - a.value).slice(0, 6);
+
+        return Object.entries(counts).map(([label, value]) => ({ label, value })).sort((a: {label: FormType, value: number}, b: {label: FormType, value: number}) => b.value - a.value).slice(0, 6);
     }, [projectForms]);
     
     const drillPerformance = useMemo(() => {
@@ -1929,7 +1926,7 @@ const FormScreen: React.FC<{
             const newPreviews: Record<string, string> = {};
             for (const [key, file] of Object.entries(draftToEdit.fileData)) {
                 if (file) {
-                    newPreviews[key] = URL.createObjectURL(file);
+                    newPreviews[key] = URL.createObjectURL(file as File);
                 }
             }
             setPhotoPreviews(newPreviews);
@@ -2418,8 +2415,8 @@ const ReportsDashboardScreen: React.FC<{ project: Project, allIssues: FormRecord
             acc[form.form_type] = (acc[form.form_type] || 0) + 1;
             return acc;
         }, {} as Record<FormType, number>);
-        
-        return Object.entries(counts).map(([label, value]) => ({ label, value })).sort((a,b) => b.value - a.value);
+
+        return Object.entries(counts).map(([label, value]) => ({ label, value })).sort((a: {label: FormType, value: number}, b: {label: FormType, value: number}) => b.value - a.value);
     }, [filteredIssues]);
 
     const pieChartData = useMemo(() => {
