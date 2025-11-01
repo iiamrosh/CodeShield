@@ -11,20 +11,73 @@ const supabase = self.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // Create the local database schema using Dexie
 const db = new Dexie("meil_safety_offline");
-db.version(2).stores({
+db.version(4).stores({
   // '++id' means auto-incrementing primary key
   // 'data' will store form fields
   // 'file' will store the Blob object for the photo/video
   upload_queue: '++id, data, file',
   drafts: '++id, form_type, project_id',
+  user_cache: 'id', // Cache user profile for offline access
+  projects_cache: 'id', // Cache projects for offline access
+  forms_cache: 'id', // Cache form records for offline access
+  training_materials_cache: 'id', // Cache training materials
+  notifications_cache: 'id', // Cache notifications
+  drills_cache: 'id', // Cache safety drills
+  sync_queue: '++id, action, table, data, timestamp', // Queue for all offline operations
 });
 
 // The main sync event handler
 self.addEventListener('sync', (event) => {
   if (event.tag === 'sync-reports') {
-    event.waitUntil(syncReports());
+    event.waitUntil(Promise.all([syncReports(), syncQueue()]));
   }
 });
+
+async function syncQueue() {
+  console.log('Service Worker: Processing sync queue.');
+  const queueItems = await db.sync_queue.toArray();
+
+  if (queueItems.length === 0) {
+    console.log('Service Worker: No queued operations.');
+    return;
+  }
+
+  console.log(`Service Worker: Found ${queueItems.length} queued operations.`);
+
+  for (const item of queueItems) {
+    try {
+      switch (item.action) {
+        case 'UPDATE_PROJECT':
+          await supabase.from('projects').update(item.data).eq('id', item.data.id);
+          console.log(`Service Worker: Synced UPDATE_PROJECT for ${item.data.id}`);
+          break;
+        case 'DELETE_PROJECT':
+          await supabase.from('projects').delete().eq('id', item.data.id);
+          console.log(`Service Worker: Synced DELETE_PROJECT for ${item.data.id}`);
+          break;
+        case 'UPDATE_STATUS':
+          await supabase.from('form_records').update({
+            status: item.data.status,
+            updates: item.data.updates
+          }).eq('id', item.data.id);
+          console.log(`Service Worker: Synced UPDATE_STATUS for ${item.data.id}`);
+          break;
+        case 'DELETE_FORM':
+          await supabase.rpc('delete_form_record_by_id', { record_id: item.data.id });
+          console.log(`Service Worker: Synced DELETE_FORM for ${item.data.id}`);
+          break;
+        default:
+          console.warn(`Service Worker: Unknown sync action: ${item.action}`);
+      }
+      // Remove from queue on success
+      await db.sync_queue.delete(item.id);
+    } catch (error) {
+      console.error(`Service Worker: Failed to sync ${item.action}:`, error);
+      // Keep in queue for retry
+    }
+  }
+  console.log('Service Worker: Sync queue processing finished.');
+}
 
 async function syncReports() {
   console.log('Service Worker: Sync event triggered for reports.');

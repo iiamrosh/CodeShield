@@ -1,6 +1,3 @@
-
-
-
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Page, User, Project, FormType, FormField, UserRole, FormRecord, StatusUpdate, DraftRecord, TrainingMaterial, Notification, TrainingAssignment, SafetyDrill, WorkerDrill } from './types';
 import { ShieldIcon, SAFETY_MODULES, FORM_CONFIGS, DocumentIcon, VideoIcon, ImageIcon } from './constants';
@@ -12,12 +9,116 @@ declare const Dexie: any;
 
 // Initialize the local 'outbox' database
 const localDb = new Dexie("meil_safety_offline");
-localDb.version(2).stores({
+localDb.version(4).stores({
   upload_queue: '++id, data, file',
   drafts: '++id, form_type, project_id',
+  user_cache: 'id', // Cache user profile for offline access
+  projects_cache: 'id', // Cache projects for offline access
+  forms_cache: 'id', // Cache form records for offline access
+  training_materials_cache: 'id', // Cache training materials
+  notifications_cache: 'id', // Cache notifications
+  drills_cache: 'id', // Cache safety drills
+  sync_queue: '++id, action, table, data, timestamp', // Queue for all offline operations
+});
+
+// Open database and log
+localDb.open().then(() => {
+    console.log('✅ IndexedDB opened successfully');
+}).catch(err => {
+    console.error('❌ IndexedDB failed to open:', err);
 });
 
 // --- UI COMPONENTS ---
+const PullToRefresh: React.FC<{ onRefresh: () => Promise<void>; children: React.ReactNode }> = ({ onRefresh, children }) => {
+    const [isPulling, setIsPulling] = useState(false);
+    const [startY, setStartY] = useState(0);
+    const [pullDistance, setPullDistance] = useState(0);
+    const [isRefreshing, setIsRefreshing] = useState(false);
+    const threshold = 80; // pixels to pull before triggering refresh
+
+    const handleTouchStart = (e: React.TouchEvent) => {
+        const touch = e.touches[0];
+        setStartY(touch.clientY);
+        setIsPulling(true);
+    };
+
+    const handleTouchMove = (e: React.TouchEvent) => {
+        if (!isPulling || isRefreshing) return;
+        
+        const touch = e.touches[0];
+        const currentY = touch.clientY;
+        const distance = currentY - startY;
+        
+        // Only allow pulling down when at top of page
+        if (distance > 0 && window.scrollY === 0) {
+            setPullDistance(Math.min(distance, threshold * 1.5));
+        }
+    };
+
+    const handleTouchEnd = async () => {
+        setIsPulling(false);
+        
+        if (pullDistance >= threshold && !isRefreshing) {
+            setIsRefreshing(true);
+            try {
+                await onRefresh();
+            } catch (error) {
+                console.error('Refresh failed:', error);
+            } finally {
+                setIsRefreshing(false);
+                setPullDistance(0);
+            }
+        } else {
+            setPullDistance(0);
+        }
+    };
+
+    const refreshOpacity = Math.min(pullDistance / threshold, 1);
+    const showRefreshIcon = pullDistance > 10;
+
+    return (
+        <div
+            onTouchStart={handleTouchStart}
+            onTouchMove={handleTouchMove}
+            onTouchEnd={handleTouchEnd}
+            style={{ position: 'relative' }}
+        >
+            {showRefreshIcon && (
+                <div
+                    className="absolute top-0 left-0 right-0 flex items-center justify-center transition-all duration-200"
+                    style={{
+                        height: `${Math.min(pullDistance, threshold)}px`,
+                        opacity: refreshOpacity,
+                        transform: `translateY(${pullDistance >= threshold ? 0 : -20}px)`,
+                    }}
+                >
+                    <div className="flex flex-col items-center">
+                        <svg
+                            className={`w-6 h-6 text-[#1FA97C] ${isRefreshing ? 'animate-rotate' : ''}`}
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                        >
+                            <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth={2}
+                                d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                            />
+                        </svg>
+                        <span className="text-xs text-gray-600 mt-1">
+                            {isRefreshing ? 'Refreshing...' : pullDistance >= threshold ? 'Release to refresh' : 'Pull to refresh'}
+                        </span>
+                    </div>
+                </div>
+            )}
+            <div style={{ transform: `translateY(${isRefreshing ? `${threshold}px` : `${pullDistance}px`})`, transition: isPulling ? 'none' : 'transform 0.3s ease-out' }}>
+                {children}
+            </div>
+        </div>
+    );
+};
+
 const BackButton: React.FC<{ onClick: () => void }> = ({ onClick }) => (
     <button 
         onClick={onClick} 
@@ -249,12 +350,62 @@ const App: React.FC = () => {
     const [drafts, setDrafts] = useState<DraftRecord[]>([]);
     const [draftToEdit, setDraftToEdit] = useState<DraftRecord | null>(null);
     const [selectedDrill, setSelectedDrill] = useState<SafetyDrill | null>(null);
+    const [pendingSyncCount, setPendingSyncCount] = useState(0);
     
     // New state for worker dashboard
     const [trainingAssignments, setTrainingAssignments] = useState<TrainingAssignment[]>([]);
     const [safetyDrills, setSafetyDrills] = useState<SafetyDrill[]>([]);
     const [workerDrills, setWorkerDrills] = useState<WorkerDrill[]>([]);
     const [projectWorkerDrills, setProjectWorkerDrills] = useState<WorkerDrill[]>([]); // For managers
+
+    // Register service worker for offline support
+    useEffect(() => {
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/service-worker.js')
+                .then(registration => {
+                    console.log('✅ Service Worker registered:', registration);
+                })
+                .catch(error => {
+                    console.error('❌ Service Worker registration failed:', error);
+                });
+        }
+    }, []);
+
+    // Monitor online/offline status with proper state updates
+    useEffect(() => {
+        const handleOnline = () => {
+            console.log('🟢 Network: Online');
+            setIsOnline(true);
+            // Force re-render
+            setTimeout(() => {
+                if (currentUser) {
+                    console.log('Refreshing data after coming online...');
+                }
+            }, 500);
+        };
+        
+        const handleOffline = () => {
+            console.log('🔴 Network: Offline');
+            setIsOnline(false);
+            // Force re-render to show offline banner
+            setTimeout(() => {
+                console.log('App is now in offline mode');
+            }, 100);
+        };
+        
+        window.addEventListener('online', handleOnline);
+        window.addEventListener('offline', handleOffline);
+        
+        // Check and log initial status
+        const initialStatus = navigator.onLine;
+        console.log('📡 Initial network status:', initialStatus ? 'Online ✅' : 'Offline ❌');
+        setIsOnline(initialStatus);
+        
+        return () => {
+            window.removeEventListener('online', handleOnline);
+            window.removeEventListener('offline', handleOffline);
+        };
+    }, [currentUser]);
 
 
     // --- REMOVED FAULTY SERVICE WORKER REGISTRATION ---
@@ -282,69 +433,197 @@ const App: React.FC = () => {
 
     // --- AUTH & SESSION ---
     useEffect(() => {
+        let mounted = true;
+        
         const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+            if (!mounted) return;
+            console.log('Auth state changed:', _event, session ? '✅ Session active' : '❌ No session');
             setSession(session);
             if (session?.user) {
                 fetchUserProfile(session.user.id);
             } else {
                 setCurrentUser(null);
-                navigateAndReplace(Page.Auth);
-                setIsLoading(false);
+                if (!isOnline) {
+                    // Check cache for offline user
+                    console.log('Offline - checking cache for user session...');
+                    setTimeout(() => {
+                        if (mounted) {
+                            navigateAndReplace(Page.Auth);
+                            setIsLoading(false);
+                        }
+                    }, 1000);
+                } else {
+                    navigateAndReplace(Page.Auth);
+                    setIsLoading(false);
+                }
             }
         });
         
-        supabase.auth.getSession().then(({ data: { session } }) => {
+        // Try to get existing session
+        supabase.auth.getSession().then(({ data: { session }, error }) => {
+            if (!mounted) return;
+            
+            if (error) {
+                console.error('Error getting session:', error);
+                // Try cache if offline
+                if (!isOnline) {
+                    console.log('Offline - will try to restore from cache');
+                }
+                setIsLoading(false);
+                return;
+            }
+            
             if (session) {
-                 setSession(session);
-                 fetchUserProfile(session.user.id);
+                console.log('✅ Session found');
+                setSession(session);
+                fetchUserProfile(session.user.id);
             } else {
+                console.log('❌ No session found');
                 navigateAndReplace(Page.Auth);
                 setIsLoading(false);
             }
+        }).catch(err => {
+            console.error('Session check failed:', err);
+            setIsLoading(false);
         });
 
-        return () => subscription.unsubscribe();
-    }, [navigateAndReplace]);
+        return () => {
+            mounted = false;
+            subscription.unsubscribe();
+        };
+    }, [navigateAndReplace, isOnline]);
 
     const fetchUserProfile = async (userId: string) => {
         setIsLoading(true);
-        const { data, error } = await supabase.from('users').select('*').eq('id', userId).single();
-        if (error) {
-            console.error('Error fetching user profile:', error);
-            handleLogout();
-        } else if (data) {
-            const user: User = {
-                id: data.id,
-                fullName: data.full_name,
-                employeeId: data.employee_id,
-                emergencyContact: data.emergency_contact,
-                role: data.role,
-                profilePhotoUrl: data.profile_photo_url,
-            };
-            setCurrentUser(user);
-            navigateAndReplace(Page.ProjectHub);
+        
+        try {
+            // Try to fetch from cache first for offline support
+            const cachedUser = await localDb.user_cache.get(userId);
+            
+            if (isOnline) {
+                // Online: Try to fetch fresh data from Supabase
+                try {
+                    const { data, error } = await supabase.from('users').select('*').eq('id', userId).single();
+                    if (error) throw error;
+                    
+                    if (data) {
+                        const user: User = {
+                            id: data.id,
+                            fullName: data.full_name,
+                            employeeId: data.employee_id,
+                            emergencyContact: data.emergency_contact,
+                            role: data.role,
+                            profilePhotoUrl: data.profile_photo_url,
+                        };
+                        // Cache user profile for offline access
+                        await localDb.user_cache.put(user);
+                        setCurrentUser(user);
+                        navigateAndReplace(Page.ProjectHub);
+                    }
+                } catch (error) {
+                    console.error('Error fetching user profile:', error);
+                    // If online fetch fails but we have cache, use cache
+                    if (cachedUser) {
+                        console.log('Using cached user profile due to fetch error');
+                        setCurrentUser(cachedUser);
+                        navigateAndReplace(Page.ProjectHub);
+                    } else {
+                        handleLogout();
+                    }
+                }
+            } else {
+                // Offline: Use cached data
+                if (cachedUser) {
+                    console.log('Offline mode: Using cached user profile');
+                    setCurrentUser(cachedUser);
+                    navigateAndReplace(Page.ProjectHub);
+                } else {
+                    // No cache available and offline - must login when online
+                    console.warn('No cached user data available while offline');
+                    showModal('Offline', 'Please connect to the internet to sign in for the first time.', 'info');
+                    navigateAndReplace(Page.Auth);
+                }
+            }
+        } catch (error) {
+            console.error('Unexpected error in fetchUserProfile:', error);
+            navigateAndReplace(Page.Auth);
+        } finally {
+            setIsLoading(false);
         }
-        setIsLoading(false);
     };
 
     // --- DATA FETCHING ---
     const fetchProjects = useCallback(async () => {
         if (!currentUser) return;
         setIsLoading(true);
-        const { data, error } = await supabase.from('projects').select('*, created_by(id, full_name)').order('created_at', { ascending: false });
-        if (error) console.error('Error fetching projects:', error);
-        else setProjects(data as Project[]);
-        setIsLoading(false);
-    }, [currentUser]);
+        
+        try {
+            if (isOnline) {
+                try {
+                    const { data, error } = await supabase.from('projects').select('*, created_by(id, full_name)').order('created_at', { ascending: false });
+                    if (error) throw error;
+                    
+                    setProjects(data as Project[]);
+                    // Update cache
+                    await localDb.projects_cache.clear();
+                    await localDb.projects_cache.bulkPut(data as Project[]);
+                } catch (error) {
+                    console.error('Error fetching projects:', error);
+                    // Try to load from cache
+                    const cached = await localDb.projects_cache.toArray();
+                    if (cached.length > 0) {
+                        console.log('Using cached projects due to fetch error');
+                        setProjects(cached);
+                    }
+                }
+            } else {
+                // Offline: Use cached data
+                const cached = await localDb.projects_cache.toArray();
+                console.log('Offline mode: Using cached projects', cached.length);
+                setProjects(cached);
+            }
+        } catch (error) {
+            console.error('Unexpected error in fetchProjects:', error);
+        } finally {
+            setIsLoading(false);
+        }
+    }, [currentUser, isOnline]);
 
     const fetchForms = useCallback(async () => {
         if (!currentUser) return;
         setIsLoading(true);
-        const { data, error } = await supabase.from('form_records').select('*, submitted_by_id(id, full_name)').order('submitted_at', { ascending: false });
-        if (error) console.error('Error fetching forms:', error);
-        else setSubmittedForms(data as FormRecord[]);
-        setIsLoading(false);
-    }, [currentUser]);
+        
+        try {
+            if (isOnline) {
+                try {
+                    const { data, error } = await supabase.from('form_records').select('*, submitted_by_id(id, full_name)').order('submitted_at', { ascending: false });
+                    if (error) throw error;
+                    
+                    setSubmittedForms(data as FormRecord[]);
+                    // Update cache
+                    await localDb.forms_cache.clear();
+                    await localDb.forms_cache.bulkPut(data as FormRecord[]);
+                } catch (error) {
+                    console.error('Error fetching forms:', error);
+                    // Try to load from cache
+                    const cached = await localDb.forms_cache.toArray();
+                    if (cached.length > 0) {
+                        console.log('Using cached forms due to fetch error');
+                        setSubmittedForms(cached);
+                    }
+                }
+            } else {
+                // Offline: Use cached data
+                const cached = await localDb.forms_cache.toArray();
+                console.log('Offline mode: Using cached forms', cached.length);
+                setSubmittedForms(cached);
+            }
+        } catch (error) {
+            console.error('Unexpected error in fetchForms:', error);
+        } finally {
+            setIsLoading(false);
+        }
+    }, [currentUser, isOnline]);
 
     const fetchDrafts = useCallback(async () => {
         const allDrafts = await localDb.drafts.toArray();
@@ -353,93 +632,209 @@ const App: React.FC = () => {
     
     const fetchTrainingMaterials = useCallback(async () => {
         if (!currentUser) return;
-        const { data: materialsData, error } = await supabase.from('training_materials').select('*').order('created_at', { ascending: false });
+        
+        try {
+            if (isOnline) {
+                try {
+                    const { data: materialsData, error } = await supabase.from('training_materials').select('*').order('created_at', { ascending: false });
+                    if (error) {
+                        if (error.code === '42P01') { 
+                             console.warn("Training materials table not found. Please create it in Supabase.");
+                             setTrainingMaterials([]);
+                             return;
+                        }
+                        throw error;
+                    }
 
-        if (error) {
-            console.error('Error fetching training materials:', error);
-            if (error.code === '42P01') { 
-                 console.warn("Training materials table not found. Please create it in Supabase.");
-                 setTrainingMaterials([]);
-            }
-        } else {
-            const materialIds = materialsData.map(m => m.id);
-            if (materialIds.length > 0) {
-                const { data: viewsData, error: viewsError } = await supabase
-                    .from('training_material_views')
-                    .select('material_id')
-                    .in('material_id', materialIds);
+                    const materialIds = materialsData.map(m => m.id);
+                    if (materialIds.length > 0) {
+                        const { data: viewsData, error: viewsError } = await supabase
+                            .from('training_material_views')
+                            .select('material_id')
+                            .in('material_id', materialIds);
 
-                if (viewsError) {
-                    console.error("Error fetching training views:", viewsError);
-                    setTrainingMaterials(materialsData as TrainingMaterial[]); // Set data without counts on error
-                } else {
-                    const viewCounts = viewsData.reduce((acc: Record<string, number>, view) => {
-                        acc[view.material_id] = (acc[view.material_id] || 0) + 1;
-                        return acc;
-                    }, {});
-                    const materialsWithCounts = materialsData.map(material => ({
-                        ...material,
-                        view_count: viewCounts[material.id] || 0,
-                    }));
-                    setTrainingMaterials(materialsWithCounts as TrainingMaterial[]);
+                        if (viewsError) {
+                            console.error("Error fetching training views:", viewsError);
+                            setTrainingMaterials(materialsData as TrainingMaterial[]);
+                        } else {
+                            const viewCounts = viewsData.reduce((acc: Record<string, number>, view) => {
+                                acc[view.material_id] = (acc[view.material_id] || 0) + 1;
+                                return acc;
+                            }, {});
+                            const materialsWithCounts = materialsData.map(material => ({
+                                ...material,
+                                view_count: viewCounts[material.id] || 0,
+                            }));
+                            setTrainingMaterials(materialsWithCounts as TrainingMaterial[]);
+                            // Update cache
+                            await localDb.training_materials_cache.clear();
+                            await localDb.training_materials_cache.bulkPut(materialsWithCounts);
+                        }
+                    } else {
+                        setTrainingMaterials(materialsData as TrainingMaterial[]);
+                        await localDb.training_materials_cache.clear();
+                        await localDb.training_materials_cache.bulkPut(materialsData);
+                    }
+                } catch (error: any) {
+                    console.error('Error fetching training materials:', error);
+                    // Try to load from cache
+                    const cached = await localDb.training_materials_cache.toArray();
+                    if (cached.length > 0) {
+                        console.log('Using cached training materials due to fetch error');
+                        setTrainingMaterials(cached);
+                    }
                 }
             } else {
-                setTrainingMaterials(materialsData as TrainingMaterial[]);
+                // Offline: Use cached data
+                const cached = await localDb.training_materials_cache.toArray();
+                console.log('Offline mode: Using cached training materials', cached.length);
+                setTrainingMaterials(cached);
             }
+        } catch (error) {
+            console.error('Unexpected error in fetchTrainingMaterials:', error);
         }
-    }, [currentUser]);
+    }, [currentUser, isOnline]);
 
 
     const fetchNotifications = useCallback(async () => {
         if (!currentUser) return;
-        const { data, error } = await supabase.from('notifications').select('*').eq('is_read', false).order('created_at', { ascending: false });
-
-        if (error) {
-            console.error('Error fetching notifications:', error);
-            if (error.code === '42P01') { 
-                 console.warn("Notifications table not found. Please create it in Supabase to enable dynamic alerts.");
-                 setNotifications([]);
+        
+        try {
+            if (isOnline) {
+                try {
+                    const { data, error } = await supabase.from('notifications').select('*').eq('is_read', false).order('created_at', { ascending: false });
+                    if (error) {
+                        if (error.code === '42P01') { 
+                             console.warn("Notifications table not found. Please create it in Supabase to enable dynamic alerts.");
+                             setNotifications([]);
+                             return;
+                        }
+                        throw error;
+                    }
+                    
+                    setNotifications(data as Notification[]);
+                    // Update cache
+                    await localDb.notifications_cache.clear();
+                    await localDb.notifications_cache.bulkPut(data);
+                } catch (error: any) {
+                    console.error('Error fetching notifications:', error);
+                    // Try to load from cache
+                    const cached = await localDb.notifications_cache.toArray();
+                    if (cached.length > 0) {
+                        console.log('Using cached notifications due to fetch error');
+                        setNotifications(cached);
+                    }
+                }
+            } else {
+                // Offline: Use cached data
+                const cached = await localDb.notifications_cache.toArray();
+                console.log('Offline mode: Using cached notifications', cached.length);
+                setNotifications(cached);
             }
-        } else {
-            setNotifications(data as Notification[]);
+        } catch (error) {
+            console.error('Unexpected error in fetchNotifications:', error);
         }
-    }, [currentUser]);
+    }, [currentUser, isOnline]);
     
     const fetchTrainingAssignments = useCallback(async () => {
         if (!currentUser || currentUser.role !== 'Workers') return;
-        const { data, error } = await supabase.from('training_assignments').select('*, training_materials(*)').eq('worker_id', currentUser.id);
-        if (error) {
-            console.error("Error fetching training assignments:", error);
-            if (error.code === '42P01') console.warn("training_assignments table not found.");
-            setTrainingAssignments([]);
-        } else {
-            setTrainingAssignments(data as TrainingAssignment[]);
+        
+        try {
+            if (isOnline) {
+                try {
+                    const { data, error } = await supabase.from('training_assignments').select('*, training_materials(*)').eq('worker_id', currentUser.id);
+                    if (error) {
+                        if (error.code === '42P01') {
+                            console.warn("training_assignments table not found.");
+                            setTrainingAssignments([]);
+                            return;
+                        }
+                        throw error;
+                    }
+                    setTrainingAssignments(data as TrainingAssignment[]);
+                } catch (error) {
+                    console.error("Error fetching training assignments:", error);
+                    setTrainingAssignments([]);
+                }
+            } else {
+                // In offline mode, training assignments aren't critical
+                setTrainingAssignments([]);
+            }
+        } catch (error) {
+            console.error('Unexpected error in fetchTrainingAssignments:', error);
         }
-    }, [currentUser]);
+    }, [currentUser, isOnline]);
 
     const fetchSafetyDrills = useCallback(async () => {
         if (!currentUser || !selectedProject) return;
-        const { data, error } = await supabase.from('safety_drills').select('*').eq('project_id', selectedProject.id).order('created_at', { ascending: false });
-         if (error) {
-            console.error("Error fetching safety drills:", error.message || error);
-            if (error.code === '42P01') console.warn("safety_drills table not found.");
-            setSafetyDrills([]);
-        } else {
-            setSafetyDrills(data as SafetyDrill[]);
+        
+        try {
+            if (isOnline) {
+                try {
+                    const { data, error } = await supabase.from('safety_drills').select('*').eq('project_id', selectedProject.id).order('created_at', { ascending: false });
+                    if (error) {
+                        if (error.code === '42P01') {
+                            console.warn("safety_drills table not found.");
+                            setSafetyDrills([]);
+                            return;
+                        }
+                        throw error;
+                    }
+                    
+                    setSafetyDrills(data as SafetyDrill[]);
+                    // Update cache for this project
+                    await localDb.drills_cache.where('project_id').equals(selectedProject.id).delete();
+                    if (data.length > 0) {
+                        await localDb.drills_cache.bulkPut(data);
+                    }
+                } catch (error: any) {
+                    console.error("Error fetching safety drills:", error);
+                    // Try to load from cache for this project
+                    const cached = await localDb.drills_cache.where('project_id').equals(selectedProject.id).toArray();
+                    if (cached.length > 0) {
+                        console.log('Using cached safety drills due to fetch error');
+                        setSafetyDrills(cached);
+                    }
+                }
+            } else {
+                // Offline: Use cached data
+                const cached = await localDb.drills_cache.where('project_id').equals(selectedProject.id).toArray();
+                console.log('Offline mode: Using cached safety drills', cached.length);
+                setSafetyDrills(cached);
+            }
+        } catch (error) {
+            console.error('Unexpected error in fetchSafetyDrills:', error);
         }
-    }, [currentUser, selectedProject]);
+    }, [currentUser, selectedProject, isOnline]);
 
     const fetchWorkerDrills = useCallback(async () => {
         if (!currentUser || currentUser.role !== 'Workers') return;
-        const { data, error } = await supabase.from('worker_drills').select('*').eq('worker_id', currentUser.id);
-        if (error) {
-            console.error("Error fetching worker drills:", error);
-            if (error.code === '42P01') console.warn("worker_drills table not found.");
-            setWorkerDrills([]);
-        } else {
-            setWorkerDrills(data as WorkerDrill[]);
+        
+        try {
+            if (isOnline) {
+                try {
+                    const { data, error } = await supabase.from('worker_drills').select('*').eq('worker_id', currentUser.id);
+                    if (error) {
+                        if (error.code === '42P01') {
+                            console.warn("worker_drills table not found.");
+                            setWorkerDrills([]);
+                            return;
+                        }
+                        throw error;
+                    }
+                    setWorkerDrills(data as WorkerDrill[]);
+                } catch (error) {
+                    console.error("Error fetching worker drills:", error);
+                    setWorkerDrills([]);
+                }
+            } else {
+                // In offline mode, worker drills aren't critical
+                setWorkerDrills([]);
+            }
+        } catch (error) {
+            console.error('Unexpected error in fetchWorkerDrills:', error);
         }
-    }, [currentUser]);
+    }, [currentUser, isOnline]);
 
     const fetchProjectWorkerDrills = useCallback(async () => {
         if (!currentUser || !selectedProject || currentUser.role === 'Workers' || safetyDrills.length === 0) {
@@ -558,6 +953,10 @@ const App: React.FC = () => {
 
     const handleLogout = async () => {
         await supabase.auth.signOut();
+        // Clear cached user data on logout
+        if (currentUser) {
+            await localDb.user_cache.delete(currentUser.id);
+        }
         setCurrentUser(null);
         setSelectedProject(null);
         setProjects([]);
@@ -565,43 +964,140 @@ const App: React.FC = () => {
         navigateAndReplace(Page.Auth);
     };
     
+    // --- OFFLINE SYNC QUEUE MANAGEMENT ---
+    const updatePendingSyncCount = useCallback(async () => {
+        const uploadQueue = await localDb.upload_queue.count();
+        const syncQueue = await localDb.sync_queue.count();
+        setPendingSyncCount(uploadQueue + syncQueue);
+    }, []);
+    
+    const processSyncQueue = useCallback(async () => {
+        if (!isOnline) return;
+        
+        const queueItems = await localDb.sync_queue.toArray();
+        if (queueItems.length === 0) return;
+        
+        console.log(`Processing ${queueItems.length} queued operations...`);
+        
+        for (const item of queueItems) {
+            try {
+                switch (item.action) {
+                    case 'UPDATE_PROJECT':
+                        await supabase.from('projects').update(item.data).eq('id', item.data.id);
+                        break;
+                    case 'DELETE_PROJECT':
+                        await supabase.from('projects').delete().eq('id', item.data.id);
+                        break;
+                    case 'UPDATE_STATUS':
+                        await supabase.from('form_records').update({
+                            status: item.data.status,
+                            updates: item.data.updates
+                        }).eq('id', item.data.id);
+                        break;
+                    case 'DELETE_FORM':
+                        await supabase.rpc('delete_form_record_by_id', { record_id: item.data.id });
+                        break;
+                    default:
+                        console.warn(`Unknown sync action: ${item.action}`);
+                }
+                // Remove from queue on success
+                await localDb.sync_queue.delete(item.id!);
+                console.log(`Synced: ${item.action}`);
+            } catch (error) {
+                console.error(`Failed to sync ${item.action}:`, error);
+                // Keep in queue for retry
+            }
+        }
+        
+        // Refresh data after sync
+        await fetchProjects();
+        await fetchForms();
+        await updatePendingSyncCount();
+    }, [isOnline, fetchProjects, fetchForms, updatePendingSyncCount]);
+    
+    // Update sync count periodically and when going online
+    useEffect(() => {
+        updatePendingSyncCount();
+        const interval = setInterval(updatePendingSyncCount, 5000); // Check every 5 seconds
+        return () => clearInterval(interval);
+    }, [updatePendingSyncCount]);
+    
+    // Process sync queue when coming back online and refresh data
+    useEffect(() => {
+        if (isOnline && currentUser) {
+            console.log('Connection restored - syncing...');
+            processSyncQueue();
+            // Refresh all data when coming back online
+            fetchProjects();
+            fetchForms();
+            fetchTrainingMaterials();
+            fetchNotifications();
+            fetchSafetyDrills();
+            if (currentUser.role === 'Workers') {
+                fetchTrainingAssignments();
+                fetchWorkerDrills();
+            }
+        }
+    }, [isOnline, currentUser]); // Deliberately not including all functions to avoid infinite loops
+    
     // --- CRUD OPERATIONS ---
     const handleUpdateUser = async (updatedData: Partial<User>, photoFile?: File) => {
         if (!currentUser) return;
+        
+        if (!isOnline) {
+            showModal('Offline Mode', 'Profile updates require an internet connection.', 'info');
+            return;
+        }
+        
         setIsLoading(true);
         
-        let photo_url = currentUser.profilePhotoUrl;
+        try {
+            let photo_url = currentUser.profilePhotoUrl;
 
-        if (photoFile) {
-            const filePath = `profiles/${currentUser.id}/${Date.now()}_${photoFile.name}`;
-            const { error: uploadError } = await supabase.storage.from('safety-uploads').upload(filePath, photoFile);
-            if (uploadError) {
-                showModal('Error uploading photo', uploadError.message, 'error');
-                setIsLoading(false);
-                return;
+            if (photoFile) {
+                const filePath = `profiles/${currentUser.id}/${Date.now()}_${photoFile.name}`;
+                const { error: uploadError } = await supabase.storage.from('safety-uploads').upload(filePath, photoFile);
+                if (uploadError) {
+                    showModal('Error uploading photo', uploadError.message, 'error');
+                    return;
+                }
+                const { data: { publicUrl } } = supabase.storage.from('safety-uploads').getPublicUrl(filePath);
+                photo_url = publicUrl;
             }
-            const { data: { publicUrl } } = supabase.storage.from('safety-uploads').getPublicUrl(filePath);
-            photo_url = publicUrl;
-        }
 
-        const { data, error } = await supabase.from('users').update({
-            full_name: updatedData.fullName,
-            emergency_contact: updatedData.emergencyContact,
-            profile_photo_url: photo_url
-        }).eq('id', currentUser.id).select().single();
-        
-        if (error) {
-            showModal('Error updating profile', error.message, 'error');
-        } else if (data) {
-            setCurrentUser(prev => ({ ...prev!, fullName: data.full_name, emergencyContact: data.emergency_contact, profilePhotoUrl: data.profile_photo_url }));
-            showModal('Success', 'Profile updated successfully!', 'success', goBack);
+            const { data, error } = await supabase.from('users').update({
+                full_name: updatedData.fullName,
+                emergency_contact: updatedData.emergencyContact,
+                profile_photo_url: photo_url
+            }).eq('id', currentUser.id).select().single();
+            
+            if (error) {
+                showModal('Error updating profile', error.message, 'error');
+            } else if (data) {
+                const updatedUser = { ...currentUser, fullName: data.full_name, emergencyContact: data.emergency_contact, profilePhotoUrl: data.profile_photo_url };
+                setCurrentUser(updatedUser);
+                // Update cache
+                await localDb.user_cache.put(updatedUser);
+                showModal('Success', 'Profile updated successfully!', 'success', goBack);
+            }
+        } catch (error: any) {
+            console.error('Error updating user:', error);
+            showModal('Error', 'Failed to update profile. Please try again.', 'error');
+        } finally {
+            setIsLoading(false);
         }
-        setIsLoading(false);
     };
     
     const addProject = async (project: Pick<Project, 'name' | 'severity' | 'location' | 'department'>) => {
         if (!currentUser) return;
         setIsLoading(true);
+        
+        if (!isOnline) {
+            showModal("Offline Mode", "Creating projects requires an internet connection.", 'info');
+            setIsLoading(false);
+            return;
+        }
+        
         const { error } = await supabase.from('projects').insert({
             name: project.name,
             project_id: `PRJ${Date.now()}`,
@@ -628,21 +1124,62 @@ const App: React.FC = () => {
     
     const handleUpdateProject = async (updatedProject: Project) => {
         setIsLoading(true);
-        const { error } = await supabase.from('projects').update({
-            name: updatedProject.name,
-            severity: updatedProject.severity,
-            location: updatedProject.location,
-            department: updatedProject.department,
-            status: updatedProject.status,
-        }).eq('id', updatedProject.id);
-        setIsLoading(false);
-        if (error) {
-            showModal("Error updating project", error.message, 'error');
-        } else {
-            showModal("Project Updated", "The project has been successfully updated.", 'success', () => {
-                fetchProjects();
+        
+        if (!isOnline) {
+            // Queue for later sync
+            await localDb.sync_queue.add({
+                action: 'UPDATE_PROJECT',
+                table: 'projects',
+                data: {
+                    id: updatedProject.id,
+                    name: updatedProject.name,
+                    severity: updatedProject.severity,
+                    location: updatedProject.location,
+                    department: updatedProject.department,
+                    status: updatedProject.status,
+                },
+                timestamp: new Date().toISOString(),
+            });
+            
+            // Update local cache optimistically
+            const cachedProjects = await localDb.projects_cache.toArray();
+            const updatedCache = cachedProjects.map(p => 
+                p.id === updatedProject.id ? { ...p, ...updatedProject } : p
+            );
+            await localDb.projects_cache.clear();
+            await localDb.projects_cache.bulkPut(updatedCache);
+            setProjects(updatedCache);
+            await updatePendingSyncCount();
+            
+            setIsLoading(false);
+            showModal("Queued for Sync", "Project changes will be synced when you're back online.", 'info', () => {
                 navigateAndReplace(Page.ProjectHub);
             });
+            return;
+        }
+        
+        try {
+            const { error } = await supabase.from('projects').update({
+                name: updatedProject.name,
+                severity: updatedProject.severity,
+                location: updatedProject.location,
+                department: updatedProject.department,
+                status: updatedProject.status,
+            }).eq('id', updatedProject.id);
+            
+            if (error) {
+                showModal("Error updating project", error.message, 'error');
+            } else {
+                showModal("Project Updated", "The project has been successfully updated.", 'success', () => {
+                    fetchProjects();
+                    navigateAndReplace(Page.ProjectHub);
+                });
+            }
+        } catch (error: any) {
+            console.error('Error updating project:', error);
+            showModal("Error", "Failed to update project. Please try again.", 'error');
+        } finally {
+            setIsLoading(false);
         }
     };
 
@@ -655,13 +1192,39 @@ const App: React.FC = () => {
             async () => { // on confirm
                 closeModal();
                 setIsLoading(true);
-                const { error } = await supabase.from('projects').delete().eq('id', projectId);
-                setIsLoading(false);
-                if (error) {
-                    showModal("Error deleting project", error.message, 'error');
-                } else {
-                    showModal("Success", "Project deleted successfully.", 'success');
-                    fetchProjects();
+                
+                if (!isOnline) {
+                    // Queue for later sync
+                    await localDb.sync_queue.add({
+                        action: 'DELETE_PROJECT',
+                        table: 'projects',
+                        data: { id: projectId },
+                        timestamp: new Date().toISOString(),
+                    });
+                    
+                    // Remove from local cache
+                    await localDb.projects_cache.delete(projectId);
+                    setProjects(prev => prev.filter(p => p.id !== projectId));
+                    await updatePendingSyncCount();
+                    
+                    setIsLoading(false);
+                    showModal("Queued for Sync", "Project deletion will be synced when you're back online.", 'info');
+                    return;
+                }
+                
+                try {
+                    const { error } = await supabase.from('projects').delete().eq('id', projectId);
+                    if (error) {
+                        showModal("Error deleting project", error.message, 'error');
+                    } else {
+                        showModal("Success", "Project deleted successfully.", 'success');
+                        fetchProjects();
+                    }
+                } catch (error: any) {
+                    console.error('Error deleting project:', error);
+                    showModal("Error", "Failed to delete project. Please try again.", 'error');
+                } finally {
+                    setIsLoading(false);
                 }
             }
         );
@@ -728,9 +1291,15 @@ const App: React.FC = () => {
                 // For offline, we can only support one file for simplicity in the queue.
                 const firstFile = Object.values(fileData).find(f => f instanceof File) || null;
                 await localDb.upload_queue.add({ data: submissionPayload, file: firstFile });
-                if (navigator.serviceWorker.ready) {
-                    const registration = await navigator.serviceWorker.ready;
-                    await (registration as any).sync.register('sync-reports');
+                await updatePendingSyncCount(); // Update counter
+                
+                if (navigator.serviceWorker && navigator.serviceWorker.ready) {
+                    try {
+                        const registration = await navigator.serviceWorker.ready;
+                        await (registration as any).sync.register('sync-reports');
+                    } catch (error) {
+                        console.log('Background sync not supported:', error);
+                    }
                 }
                 showModal("Offline Mode", "You are offline. Report saved and will upload when you're back online.", 'info');
             } catch (error) {
@@ -825,6 +1394,24 @@ const App: React.FC = () => {
             async () => { // on confirm
                 closeModal();
                 setIsLoading(true);
+
+                if (!isOnline) {
+                    // Queue for later sync
+                    await localDb.sync_queue.add({
+                        action: 'DELETE_FORM',
+                        table: 'form_records',
+                        data: { id: issueId },
+                        timestamp: new Date().toISOString(),
+                    });
+                    
+                    // Remove from local cache
+                    await localDb.forms_cache.delete(issueId);
+                    setSubmittedForms(prevForms => prevForms.filter(form => form.id !== issueId));
+                    
+                    setIsLoading(false);
+                    showModal("Queued for Sync", "Report deletion will be synced when you're back online.", 'info');
+                    return;
+                }
 
                 // Use a remote procedure call (RPC) to delete the record.
                 // This is often required to handle deletions that need special permissions
@@ -993,10 +1580,42 @@ const App: React.FC = () => {
         };
 
         const existingUpdates = selectedIssue?.updates || [];
+        const allUpdates = [...existingUpdates, newUpdate];
+        
+        if (!isOnline) {
+            // Queue for later sync
+            await localDb.sync_queue.add({
+                action: 'UPDATE_STATUS',
+                table: 'form_records',
+                data: {
+                    id: issueId,
+                    status: newStatus,
+                    updates: allUpdates,
+                },
+                timestamp: new Date().toISOString(),
+            });
+            
+            // Update local cache optimistically
+            const cachedForms = await localDb.forms_cache.toArray();
+            const updatedCache = cachedForms.map(f => 
+                f.id === issueId ? { ...f, status: newStatus, updates: allUpdates } : f
+            );
+            await localDb.forms_cache.clear();
+            await localDb.forms_cache.bulkPut(updatedCache);
+            setSubmittedForms(updatedCache);
+            
+            if (selectedIssue) {
+                setSelectedIssue({ ...selectedIssue, status: newStatus, updates: allUpdates });
+            }
+            
+            setIsLoading(false);
+            showModal("Queued for Sync", "Status update will be synced when you're back online.", 'info', goBack);
+            return;
+        }
         
         const { error } = await supabase.from('form_records').update({
             status: newStatus,
-            updates: [...existingUpdates, newUpdate]
+            updates: allUpdates
         }).eq('id', issueId);
 
         setIsLoading(false);
@@ -1202,9 +1821,50 @@ const App: React.FC = () => {
                 />
                 {showBackButton && <BackButton onClick={goBack} />}
                 {isLoading && <div className="fixed top-0 left-0 w-full h-full bg-black/20 z-50 flex items-center justify-center"><div className="bg-white p-4 rounded-lg shadow-xl">Loading...</div></div>}
+                
+                {/* Debug info - shows connection status */}
+                <div className="fixed bottom-4 right-4 z-50 bg-black/80 text-white text-xs px-3 py-2 rounded-lg">
+                    <div className="flex items-center space-x-2">
+                        <div className={`w-2 h-2 rounded-full ${isOnline ? 'bg-green-400' : 'bg-red-400'}`}></div>
+                        <span>{isOnline ? 'Online' : 'Offline'}</span>
+                    </div>
+                    {pendingSyncCount > 0 && (
+                        <div className="text-yellow-300 mt-1">
+                            {pendingSyncCount} pending
+                        </div>
+                    )}
+                </div>
+                
                 {!isOnline && (
-                    <div className="sticky top-0 z-50 bg-yellow-500 text-white text-center py-1 text-sm font-semibold">
-                        Offline Mode - Reports will be saved locally.
+                    <div className="sticky top-0 z-50 bg-gradient-to-r from-yellow-500 to-orange-500 text-white py-2 px-4 shadow-lg">
+                        <div className="flex items-center justify-between text-sm font-semibold">
+                            <div className="flex items-center space-x-2">
+                                <svg className="w-5 h-5 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18.364 5.636a9 9 0 010 12.728m0 0l-2.829-2.829m2.829 2.829L21 21M15.536 8.464a5 5 0 010 7.072m0 0l-2.829-2.829m-4.243 2.829a4.978 4.978 0 01-1.414-2.83m-1.414 5.658a9 9 0 01-2.167-9.238m7.824 2.167a1 1 0 111.414 1.414m-1.414-1.414L3 3" />
+                                </svg>
+                                <span>Offline Mode</span>
+                            </div>
+                            {pendingSyncCount > 0 && (
+                                <div className="flex items-center space-x-1 bg-white/20 rounded-full px-3 py-1">
+                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                    </svg>
+                                    <span className="text-xs">{pendingSyncCount} pending</span>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                )}
+                {isOnline && pendingSyncCount > 0 && (
+                    <div className="sticky top-0 z-50 bg-gradient-to-r from-blue-500 to-blue-600 text-white py-2 px-4 shadow-lg">
+                        <div className="flex items-center justify-between text-sm font-semibold">
+                            <div className="flex items-center space-x-2">
+                                <svg className="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                </svg>
+                                <span>Syncing {pendingSyncCount} item(s)...</span>
+                            </div>
+                        </div>
                     </div>
                 )}
                 {pageContent()}
@@ -1233,30 +1893,80 @@ const PageHeader: React.FC<{ title: string; children?: React.ReactNode }> = ({ t
 );
 
 const SplashScreen: React.FC<{ onFinish: () => void }> = ({ onFinish }) => {
-    const [loading, setLoading] = useState(true);
+    const [progress, setProgress] = useState(0);
+    const [loadingText, setLoadingText] = useState('Initializing');
 
     useEffect(() => {
-        const startLoading = setTimeout(() => setLoading(false), 100); // Start animation after a brief moment
-        const finishTimer = setTimeout(() => onFinish(), 2200); // Total splash time
+        const loadingSteps = [
+            { progress: 0, text: 'Initializing' },
+            { progress: 25, text: 'Loading modules' },
+            { progress: 50, text: 'Connecting to server' },
+            { progress: 75, text: 'Preparing workspace' },
+            { progress: 100, text: 'Ready' }
+        ];
+
+        let currentStep = 0;
+        const stepInterval = setInterval(() => {
+            if (currentStep < loadingSteps.length) {
+                setProgress(loadingSteps[currentStep].progress);
+                setLoadingText(loadingSteps[currentStep].text);
+                currentStep++;
+            } else {
+                clearInterval(stepInterval);
+            }
+        }, 500);
+
+        const finishTimer = setTimeout(() => onFinish(), 2800);
 
         return () => {
-            clearTimeout(startLoading);
+            clearInterval(stepInterval);
             clearTimeout(finishTimer);
         };
     }, [onFinish]);
 
     return (
-        <div className="flex flex-col items-center justify-center h-screen bg-[#1FA97C]">
-            <div className="flex flex-col items-center justify-center bg-white p-12 rounded-3xl shadow-lg w-4/5 max-w-xs">
-                <ShieldIcon className="w-24 h-24" />
-                <h1 className="text-2xl font-bold text-gray-800 mt-4">MEIL Safety</h1>
-                <div className="w-full bg-gray-200 rounded-full h-2.5 mt-8 overflow-hidden">
-                    <div
-                        className="bg-[#1FA97C] h-2.5 rounded-full transition-all duration-[2000ms] ease-linear"
-                        style={{ width: loading ? '0%' : '100%' }}
-                    ></div>
+        <div className="flex flex-col items-center justify-center h-screen bg-gradient-to-br from-[#1FA97C] to-[#15865F] relative overflow-hidden">
+            {/* Animated background circles */}
+            <div className="absolute top-10 left-10 w-32 h-32 bg-white/10 rounded-full animate-pulse"></div>
+            <div className="absolute bottom-20 right-10 w-40 h-40 bg-white/10 rounded-full animate-pulse" style={{ animationDelay: '1s' }}></div>
+            <div className="absolute top-1/2 right-1/4 w-24 h-24 bg-white/10 rounded-full animate-pulse" style={{ animationDelay: '0.5s' }}></div>
+
+            <div className="flex flex-col items-center justify-center bg-white p-12 rounded-3xl shadow-2xl w-4/5 max-w-sm relative z-10 transform hover:scale-105 transition-transform duration-300">
+                {/* Shield Icon with pulse animation */}
+                <div className="relative">
+                    <div className="absolute inset-0 bg-[#1FA97C]/20 rounded-full animate-ping"></div>
+                    <ShieldIcon className="w-28 h-28 relative z-10 transform transition-all duration-500" style={{ transform: progress === 100 ? 'scale(1.1)' : 'scale(1)' }} />
+                </div>
+                
+                <h1 className="text-3xl font-bold text-gray-800 mt-6 tracking-tight">MEIL Safety</h1>
+                <p className="text-sm text-gray-500 mt-1">Construction Safety Management</p>
+                
+                {/* Loading progress bar */}
+                <div className="w-full mt-8 space-y-2">
+                    <div className="flex justify-between items-center">
+                        <span className="text-xs font-medium text-gray-600">{loadingText}</span>
+                        <span className="text-xs font-bold text-[#1FA97C]">{progress}%</span>
+                    </div>
+                    <div className="w-full bg-gray-200 rounded-full h-3 overflow-hidden shadow-inner">
+                        <div
+                            className="bg-gradient-to-r from-[#1FA97C] to-[#15865F] h-3 rounded-full transition-all duration-500 ease-out relative overflow-hidden"
+                            style={{ width: `${progress}%` }}
+                        >
+                            <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/30 to-transparent animate-shimmer"></div>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Loading dots animation */}
+                <div className="flex space-x-2 mt-6">
+                    <div className="w-2 h-2 bg-[#1FA97C] rounded-full animate-bounce"></div>
+                    <div className="w-2 h-2 bg-[#1FA97C] rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></div>
+                    <div className="w-2 h-2 bg-[#1FA97C] rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
                 </div>
             </div>
+
+            {/* Footer text */}
+            <p className="text-white/80 text-xs mt-8 font-medium">Powered by CodeShield Technology</p>
         </div>
     );
 };
@@ -1423,30 +2133,38 @@ const AppHeader: React.FC<{ title: string; user?: User; onLogout?: () => void; o
 
 const ProjectHubScreen: React.FC<{ user: User; projects: Project[]; onNavigate: (page: Page, data?: any) => void; onLogout: () => void; onDelete: (id: string, name: string) => void; onRefresh: () => void; }> = ({ user, projects, onNavigate, onLogout, onDelete, onRefresh }) => {
     const getSeverityClasses = (severity: 'Safe' | 'Medium' | 'Critical') => ({ 'Safe': 'text-green-600 bg-green-100', 'Medium': 'text-yellow-600 bg-yellow-100', 'Critical': 'text-red-600 bg-red-100' }[severity]);
+    
+    const handleRefresh = async () => {
+        await new Promise(resolve => setTimeout(resolve, 500)); // Small delay for UX
+        onRefresh();
+    };
+    
     return (
-        <div className="bg-[#FAF9F6] min-h-screen">
-            <AppHeader title="MEIL Project Hub" user={user} onLogout={onLogout} onNavigate={onNavigate} />
-            <div className="p-4 space-y-4">
-                 {user.role !== 'Workers' ? (
-                    <div className="grid grid-cols-2 gap-4">
-                        <button onClick={() => onNavigate(Page.NewProject)} className="bg-[#2E2E2E] text-white p-3 rounded-lg font-semibold flex items-center justify-center space-x-2 shadow-sm"><svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110 2h5V4a1 1 0 011-1z" clipRule="evenodd" /></svg><span>New Project</span></button>
-                        <button onClick={onRefresh} className="bg-white text-gray-700 p-3 rounded-lg font-semibold border flex items-center justify-center space-x-2 shadow-sm"><svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 110 2H4a1 1 0 01-1-1V4a1 1 0 011-1zm10 8a1 1 0 011-1h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 111.885-.666A5.002 5.002 0 0014.001 13H11a1 1 0 01-1-1z" clipRule="evenodd" /></svg><span>Refresh Hub</span></button>
-                    </div>
-                ) : <button onClick={onRefresh} className="w-full bg-white text-gray-700 p-3 rounded-lg font-semibold border flex items-center justify-center space-x-2 shadow-sm"><svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 110 2H4a1 1 0 01-1-1V4a1 1 0 011-1zm10 8a1 1 0 011-1h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 111.885-.666A5.002 5.002 0 0014.001 13H11a1 1 0 01-1-1z" clipRule="evenodd" /></svg><span>Refresh Hub</span></button>}
-                {projects.length > 0 ? projects.map(p => (
-                    <div key={p.id} className="bg-[#2E2E2E] text-white p-4 rounded-xl shadow-lg space-y-3">
-                        <div className="flex justify-between items-start">
-                            <div><h2 className="font-bold text-lg">{p.name}</h2><p className="text-xs text-gray-400">Project Code: {p.project_id}</p><p className="text-sm text-gray-300 mt-1">{p.location}</p></div>
-                            <div className="text-right flex flex-col items-end space-y-1"><span className={`text-xs font-semibold px-2 py-1 rounded-full ${p.status === 'Ongoing' ? 'bg-green-500/20 text-green-300' : 'bg-gray-500/20 text-gray-300'}`}>{p.status}</span><span className={`text-xs font-semibold px-2 py-1 rounded-full ${getSeverityClasses(p.severity)}`}>{p.severity}</span></div>
+        <PullToRefresh onRefresh={handleRefresh}>
+            <div className="bg-[#FAF9F6] min-h-screen">
+                <AppHeader title="MEIL Project Hub" user={user} onLogout={onLogout} onNavigate={onNavigate} />
+                <div className="p-4 space-y-4">
+                     {user.role !== 'Workers' ? (
+                        <div className="grid grid-cols-2 gap-4">
+                            <button onClick={() => onNavigate(Page.NewProject)} className="bg-[#2E2E2E] text-white p-3 rounded-lg font-semibold flex items-center justify-center space-x-2 shadow-sm"><svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110 2h5V4a1 1 0 011-1z" clipRule="evenodd" /></svg><span>New Project</span></button>
+                            <button onClick={onRefresh} className="bg-white text-gray-700 p-3 rounded-lg font-semibold border flex items-center justify-center space-x-2 shadow-sm"><svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 110 2H4a1 1 0 01-1-1V4a1 1 0 011-1zm10 8a1 1 0 011-1h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 111.885-.666A5.002 5.002 0 0014.001 13H11a1 1 0 01-1-1z" clipRule="evenodd" /></svg><span>Refresh Hub</span></button>
                         </div>
-                        <div className="flex space-x-2">
-                            <button onClick={() => onNavigate(Page.SafetyOfficerDashboard, { project: p })} className="flex-1 bg-white text-gray-800 py-2 rounded-lg font-semibold text-sm">Open</button>
-                            {user.role !== 'Workers' && (<><button onClick={() => onNavigate(Page.EditProject, { projectToEdit: p })} className="flex-1 bg-blue-500/80 hover:bg-blue-500 text-white py-2 rounded-lg font-semibold text-sm">Edit</button><button onClick={() => onDelete(p.id, p.name)} className="flex-1 bg-red-500/80 hover:bg-red-500 text-white py-2 rounded-lg font-semibold text-sm">Delete</button></>)}
+                    ) : <button onClick={onRefresh} className="w-full bg-white text-gray-700 p-3 rounded-lg font-semibold border flex items-center justify-center space-x-2 shadow-sm"><svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 110 2H4a1 1 0 01-1-1V4a1 1 0 011-1zm10 8a1 1 0 011-1h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 111.885-.666A5.002 5.002 0 0014.001 13H11a1 1 0 01-1-1z" clipRule="evenodd" /></svg><span>Refresh Hub</span></button>}
+                    {projects.length > 0 ? projects.map(p => (
+                        <div key={p.id} className="bg-[#2E2E2E] text-white p-4 rounded-xl shadow-lg space-y-3">
+                            <div className="flex justify-between items-start">
+                                <div><h2 className="font-bold text-lg">{p.name}</h2><p className="text-xs text-gray-400">Project Code: {p.project_id}</p><p className="text-sm text-gray-300 mt-1">{p.location}</p></div>
+                                <div className="text-right flex flex-col items-end space-y-1"><span className={`text-xs font-semibold px-2 py-1 rounded-full ${p.status === 'Ongoing' ? 'bg-green-500/20 text-green-300' : 'bg-gray-500/20 text-gray-300'}`}>{p.status}</span><span className={`text-xs font-semibold px-2 py-1 rounded-full ${getSeverityClasses(p.severity)}`}>{p.severity}</span></div>
+                            </div>
+                            <div className="flex space-x-2">
+                                <button onClick={() => onNavigate(Page.SafetyOfficerDashboard, { project: p })} className="flex-1 bg-white text-gray-800 py-2 rounded-lg font-semibold text-sm">Open</button>
+                                {user.role !== 'Workers' && (<><button onClick={() => onNavigate(Page.EditProject, { projectToEdit: p })} className="flex-1 bg-blue-500/80 hover:bg-blue-500 text-white py-2 rounded-lg font-semibold text-sm">Edit</button><button onClick={() => onDelete(p.id, p.name)} className="flex-1 bg-red-500/80 hover:bg-red-500 text-white py-2 rounded-lg font-semibold text-sm">Delete</button></>)}
+                            </div>
                         </div>
-                    </div>
-                )) : <div className="text-center py-10"><p className="text-gray-500">No projects found. Create one to get started!</p></div>}
+                    )) : <div className="text-center py-10"><p className="text-gray-500">No projects found. Create one to get started!</p></div>}
+                </div>
             </div>
-        </div>
+        </PullToRefresh>
     );
 };
 
@@ -1503,6 +2221,8 @@ const EditProjectScreen: React.FC<{ project: Project; onUpdateProject: (p: Proje
 };
 
 const SafetyOfficerDashboard: React.FC<{ user: User; project: Project; onNavigate: (page: Page, data?: any) => void; onLogout: () => void; submittedForms: FormRecord[] }> = ({ user, project, onNavigate, onLogout, submittedForms }) => {
+    const [isRefreshing, setIsRefreshing] = useState(false);
+    
     const moduleStats = useMemo(() => {
         const statsByModule: Record<FormType, { safe: number; medium: number; critical: number }> = {} as any;
         const projectForms = submittedForms.filter(f => f.project_id === project.id);
@@ -1519,44 +2239,54 @@ const SafetyOfficerDashboard: React.FC<{ user: User; project: Project; onNavigat
         }
         return statsByModule;
     }, [submittedForms, project.id]);
+    
+    const handleRefresh = async () => {
+        setIsRefreshing(true);
+        // Trigger data refresh from parent through navigation state
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        setIsRefreshing(false);
+        window.location.reload(); // Simple refresh for now
+    };
 
     return (
-        <div className="bg-[#FAF9F6] min-h-screen">
-            <AppHeader title="Safety Officer" user={user} onLogout={onLogout} onNavigate={onNavigate}/>
-            <div className="p-4 space-y-3">
-                 <button onClick={() => onNavigate(Page.ProjectHub)} className="bg-white border border-gray-300 text-gray-700 px-4 py-2 rounded-lg font-semibold text-sm flex items-center justify-center space-x-2 shadow-sm hover:bg-gray-50 mb-2 w-full"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 19l-7-7 7-7" /></svg><span>Back to Project Hub</span></button>
-                <p className="text-center font-semibold text-gray-700">Project: {project.name}</p>
-                
-                 <button onClick={() => onNavigate(Page.TrainingMaterials, { project })} className="w-full bg-[#42A5F5] text-white p-4 rounded-xl shadow-lg text-left">
-                    <h3 className="font-bold text-lg">Manage Training Materials</h3>
-                    <p className="text-xs mt-1 text-blue-100">Upload and manage training content for workers.</p>
-                </button>
+        <PullToRefresh onRefresh={handleRefresh}>
+            <div className="bg-[#FAF9F6] min-h-screen">
+                <AppHeader title="Safety Officer" user={user} onLogout={onLogout} onNavigate={onNavigate}/>
+                <div className="p-4 space-y-3">
+                     <button onClick={() => onNavigate(Page.ProjectHub)} className="bg-white border border-gray-300 text-gray-700 px-4 py-2 rounded-lg font-semibold text-sm flex items-center justify-center space-x-2 shadow-sm hover:bg-gray-50 mb-2 w-full"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 19l-7-7 7-7" /></svg><span>Back to Project Hub</span></button>
+                    <p className="text-center font-semibold text-gray-700">Project: {project.name}</p>
+                    
+                     <button onClick={() => onNavigate(Page.TrainingMaterials, { project })} className="w-full bg-[#42A5F5] text-white p-4 rounded-xl shadow-lg text-left">
+                        <h3 className="font-bold text-lg">Manage Training Materials</h3>
+                        <p className="text-xs mt-1 text-blue-100">Upload and manage training content for workers.</p>
+                    </button>
 
-                <button onClick={() => onNavigate(Page.SafetyDrillsManagement, { project })} className="w-full bg-[#F9A825] text-white p-4 rounded-xl shadow-lg text-left">
-                    <h3 className="font-bold text-lg">Manage Safety Drills</h3>
-                    <p className="text-xs mt-1 text-yellow-100">Create and assign safety drills to workers.</p>
-                </button>
-                
-                {SAFETY_MODULES.map(module => {
-                    const stats = moduleStats[module.title] || { safe: 0, medium: 0, critical: 0 };
-                    const isReportsModule = module.title === FormType.Reports;
-                    return (
-                        <button key={module.title} onClick={() => onNavigate(isReportsModule ? Page.ReportsDashboard : Page.ModuleLanding, { project, formType: module.title })} className="w-full bg-[#2E2E2E] text-white p-4 rounded-xl shadow-lg text-left disabled:opacity-50 disabled:cursor-not-allowed">
-                            <h3 className="font-bold text-lg">{module.title}</h3>
-                             {isReportsModule ? (
-                                <p className="text-xs mt-1 text-gray-400">Generate summaries and analyze performance</p>
-                             ) : (
-                                <div className="flex space-x-4 text-xs mt-1 text-gray-300">
-                                    <span className="text-green-400">● {stats.safe} Safe</span>
-                                    <span className="text-yellow-400">● {stats.medium} Medium</span>
-                                    <span className="text-red-400">● {stats.critical} Critical</span>
-                                </div>
-                             )}
-                        </button>
-                    );
-                })}
+                    <button onClick={() => onNavigate(Page.SafetyDrillsManagement, { project })} className="w-full bg-[#F9A825] text-white p-4 rounded-xl shadow-lg text-left">
+                        <h3 className="font-bold text-lg">Manage Safety Drills</h3>
+                        <p className="text-xs mt-1 text-yellow-100">Create and assign safety drills to workers.</p>
+                    </button>
+                    
+                    {SAFETY_MODULES.map(module => {
+                        const stats = moduleStats[module.title] || { safe: 0, medium: 0, critical: 0 };
+                        const isReportsModule = module.title === FormType.Reports;
+                        return (
+                            <button key={module.title} onClick={() => onNavigate(isReportsModule ? Page.ReportsDashboard : Page.ModuleLanding, { project, formType: module.title })} className="w-full bg-[#2E2E2E] text-white p-4 rounded-xl shadow-lg text-left disabled:opacity-50 disabled:cursor-not-allowed">
+                                <h3 className="font-bold text-lg">{module.title}</h3>
+                                 {isReportsModule ? (
+                                    <p className="text-xs mt-1 text-gray-400">Generate summaries and analyze performance</p>
+                                 ) : (
+                                    <div className="flex space-x-4 text-xs mt-1 text-gray-300">
+                                        <span className="text-green-400">● {stats.safe} Safe</span>
+                                        <span className="text-yellow-400">● {stats.medium} Medium</span>
+                                        <span className="text-red-400">● {stats.critical} Critical</span>
+                                    </div>
+                                 )}
+                            </button>
+                        );
+                    })}
+                </div>
             </div>
-        </div>
+        </PullToRefresh>
     );
 };
 
@@ -1571,8 +2301,8 @@ const HOManagerDashboard: React.FC<{ user: User, project: Project, onNavigate: (
             acc[form.form_type] = (acc[form.form_type] || 0) + 1;
             return acc;
         }, {} as Record<FormType, number>);
-        
-        return Object.entries(counts).map(([label, value]) => ({ label, value })).sort((a,b) => b.value - a.value).slice(0, 6);
+
+        return Object.entries(counts).map(([label, value]) => ({ label, value })).sort((a: {label: FormType, value: number}, b: {label: FormType, value: number}) => b.value - a.value).slice(0, 6);
     }, [projectForms]);
     
     const drillPerformance = useMemo(() => {
@@ -1929,7 +2659,7 @@ const FormScreen: React.FC<{
             const newPreviews: Record<string, string> = {};
             for (const [key, file] of Object.entries(draftToEdit.fileData)) {
                 if (file) {
-                    newPreviews[key] = URL.createObjectURL(file);
+                    newPreviews[key] = URL.createObjectURL(file as File);
                 }
             }
             setPhotoPreviews(newPreviews);
@@ -2418,8 +3148,8 @@ const ReportsDashboardScreen: React.FC<{ project: Project, allIssues: FormRecord
             acc[form.form_type] = (acc[form.form_type] || 0) + 1;
             return acc;
         }, {} as Record<FormType, number>);
-        
-        return Object.entries(counts).map(([label, value]) => ({ label, value })).sort((a,b) => b.value - a.value);
+
+        return Object.entries(counts).map(([label, value]) => ({ label, value })).sort((a: {label: FormType, value: number}, b: {label: FormType, value: number}) => b.value - a.value);
     }, [filteredIssues]);
 
     const pieChartData = useMemo(() => {
